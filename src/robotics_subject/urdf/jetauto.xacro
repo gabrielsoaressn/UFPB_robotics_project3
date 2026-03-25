@@ -8,4 +8,6 @@
     <xacro:include filename="$(find robotics_subject)/urdf/lidar.urdf.xacro"/>
 
     <xacro:include filename="$(find robotics_subject)/urdf/jetauto_car.urdf.xacro"/>
+
+    <xacro:include filename="$(find robotics_subject)/urdf/depth_camera.urdf.xacro"/>
 </robot>
