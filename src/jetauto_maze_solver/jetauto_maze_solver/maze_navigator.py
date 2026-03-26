@@ -6,7 +6,7 @@ Restrição absoluta: linear.y = 0.0 SEMPRE.
 
 Estados:
   INITIAL_STRAIGHT → Largada segura: vai reto até frente bloqueada
-  FOLLOW_WALL      → Seguir parede direita com correção de heading + controle P
+  FOLLOW_WALL      → Andar reto com alinhamento paralelo à parede direita
   INNER_CORNER     → Frente bloqueada → parar e girar 90° à esquerda (via TURNING)
   OUTER_CORNER     → Parede direita sumiu → avançar 0.3m reto, depois girar 90° à direita
   TURNING          → Giro controlado por odometria até atingir target_yaw
@@ -58,22 +58,21 @@ class MazeNavigator(Node):
     # Direita: setor de -100° a -50° (ângulos negativos = lado direito)
     RIGHT_LO = math.radians(-100)
     RIGHT_HI = math.radians(-50)
-    # Diagonal Direita Frontal: setor de -50° a -30° (look-ahead para alinhamento)
-    FRONT_RIGHT_LO = math.radians(-50)
-    FRONT_RIGHT_HI = math.radians(-30)
 
     # ── Limiares de distância (metros) ─────────────────────────────
     FRONT_BLOCKED = 0.6     # frente bloqueada → INNER_CORNER
     RIGHT_PRESENT = 0.8     # considera parede presente à direita
     RIGHT_LOST    = 0.85    # parede sumiu → OUTER_CORNER
-    WALL_TARGET   = 0.40    # distância alvo da parede direita (m)
+
+    # ── Alinhamento paralelo (dois raios à direita) ──────────────
+    ALIGN_SIDE_ANGLE = math.radians(-90)   # raio perpendicular à parede
+    ALIGN_DIAG_ANGLE = math.radians(-45)   # raio diagonal frontal-direita
+    ALIGN_KP    = 1.5    # ganho proporcional de alinhamento
+    ALIGN_CLAMP = 0.1    # correção angular máxima (rad/s)
 
     # ── Velocidades ────────────────────────────────────────────────
     FORWARD_SPEED = 0.15    # m/s linear para frente
     TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
-    KP_WALL       = 0.5     # ganho proporcional suave para seguir parede
-    AZ_CLAMP      = 0.15    # limite máximo de correção angular em FOLLOW_WALL
-    HEADING_CORR  = 0.2     # correção angular quando nariz mergulha na parede
 
     # ── OUTER_CORNER: distância de avanço antes de girar ───────────
     ADVANCE_DIST = 0.3      # metros
@@ -103,7 +102,8 @@ class MazeNavigator(Node):
         # ── Dados do LiDAR ──
         self.front_dist = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
-        self.front_right_dist = self.RANGE_CAP
+        self.align_side = self.RANGE_CAP   # raio a -90°
+        self.align_diag = self.RANGE_CAP   # raio a -45°
         self.scan_ready = False
 
         # ── Dados da odometria ──
@@ -167,9 +167,18 @@ class MazeNavigator(Node):
                 best = min(best, min(r, self.RANGE_CAP))
             return best
 
+        def ray_at(angle_rad):
+            """Retorna a distância de um raio específico."""
+            i = idx(angle_rad)
+            r = ranges[i]
+            if not math.isfinite(r) or r < self.LIDAR_MIN_VALID:
+                return self.RANGE_CAP
+            return min(r, self.RANGE_CAP)
+
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
-        self.front_right_dist = sector_min(self.FRONT_RIGHT_LO, self.FRONT_RIGHT_HI)
+        self.align_side = ray_at(self.ALIGN_SIDE_ANGLE)
+        self.align_diag = ray_at(self.ALIGN_DIAG_ANGLE)
         self.scan_ready = True
 
     # ══════════════════════════════════════════════════════════════════
@@ -184,13 +193,6 @@ class MazeNavigator(Node):
         self.loop_count += 1
         F = self.front_dist
         R = self.right_dist
-        FR = self.front_right_dist
-
-        # Marca primeira detecção de parede (habilita OUTER_CORNER)
-        if not self.wall_found and R < self.RIGHT_PRESENT:
-            self.wall_found = True
-            self.get_logger().info(
-                f'[NAV] Parede direita encontrada pela primeira vez (R={R:.2f}m)')
 
         # Cria mensagem de velocidade — linear.y = 0.0 SEMPRE
         twist = Twist()
@@ -200,12 +202,12 @@ class MazeNavigator(Node):
         if self.state == 'INITIAL_STRAIGHT':
             self._state_initial_straight(twist, F)
         elif self.state == 'TURNING':
-            self._state_turning(twist, F, R)
+            self._state_turning(twist)
         elif self.state == 'OUTER_CORNER':
-            self._state_outer_corner(twist, F, R)
+            self._state_outer_corner(twist, F)
         else:
             # FOLLOW_WALL é o estado padrão
-            self._state_follow_wall(twist, F, R, FR)
+            self._state_follow_wall(twist, F, R)
 
         # Publica o comando de velocidade
         self.cmd_pub.publish(twist)
@@ -243,30 +245,27 @@ class MazeNavigator(Node):
     # ESTADO: FOLLOW_WALL (Padrão)
     # ──────────────────────────────────────────────────────────────────
 
-    def _state_follow_wall(self, twist: Twist, F: float, R: float, FR: float):
+    def _state_follow_wall(self, twist: Twist, F: float, R: float):
         """
-        Seguir parede direita com correção de heading (look-ahead) e controle P.
+        Anda reto com correção de alinhamento paralelo à parede direita.
 
-        Usa duas leituras:
-          R  — distância perpendicular à direita (~-90°)
-          FR — diagonal direita frontal (~-45° a -30°)
+        Usa dois raios (-90° e -45°) para calcular o ângulo do robô em
+        relação à parede. Se há drift, aplica correção proporcional suave.
+        Sem parede visível, vai puramente reto.
 
-        Se o nariz estiver mergulhando na parede (FR ≈ R), força correção de
-        alinhamento. Caso contrário, aplica controle P com clamp suave.
-
-        Verifica transições:
-          - Frente bloqueada (F <= 0.6m) → INNER_CORNER → TURNING esquerda
-          - Parede sumiu (R > 0.85m)     → OUTER_CORNER → avanço + TURNING direita
+        Transições:
+          - Frente bloqueada (F <= 0.6m) → TURNING esquerda 90°
+          - Parede sumiu (R > 0.85m)     → OUTER_CORNER → avanço + TURNING direita 90°
         """
 
-        # ── PRIORIDADE MÁXIMA: Frente bloqueada → INNER_CORNER ──
+        # ── PRIORIDADE MÁXIMA: Frente bloqueada → giro 90° esquerda ──
         if F <= self.FRONT_BLOCKED:
             self.target_yaw = normalize_angle(
                 self.current_yaw + math.pi / 2.0)
             self.turn_direction = 1.0
             self.state = 'TURNING'
             self.get_logger().info(
-                f'[NAV] Entrando em INNER_CORNER → Freando e Girando à Esquerda  '
+                f'[NAV] FOLLOW_WALL → TURNING esquerda  '
                 f'F={F:.2f}m  R={R:.2f}m  '
                 f'target_yaw={math.degrees(self.target_yaw):.1f}°')
             twist.linear.x = 0.0
@@ -279,41 +278,49 @@ class MazeNavigator(Node):
             self.advance_start_x = self.odom_x
             self.advance_start_y = self.odom_y
             self.get_logger().info(
-                f'[NAV] Entrando em OUTER_CORNER → Avançando reto {self.ADVANCE_DIST}m  '
+                f'[NAV] FOLLOW_WALL → OUTER_CORNER  '
                 f'R={R:.2f}m  F={F:.2f}m')
             twist.linear.x = self.FORWARD_SPEED
             twist.angular.z = 0.0
             return
 
-        # ── Correção de Heading (look-ahead) ──
-        # Se FR < R + 0.1 → nariz mergulhando na parede → forçar correção
+        # ── Marca parede detectada (habilita OUTER_CORNER no futuro) ──
+        if not self.wall_found and R < self.RIGHT_PRESENT:
+            self.wall_found = True
+            self.get_logger().info(
+                f'[NAV] Parede direita confirmada (R={R:.2f}m)')
+
+        # ── Andar reto com alinhamento paralelo ──
         twist.linear.x = self.FORWARD_SPEED
 
-        if FR < R + 0.10:
-            twist.angular.z = self.HEADING_CORR
-            if self.loop_count % 20 == 0:
-                self.get_logger().info(
-                    f'[NAV] FOLLOW_WALL HEADING_CORR  F={F:.2f}m  R={R:.2f}m  '
-                    f'FR={FR:.2f}m  az={twist.angular.z:+.3f}')
-            return
+        a = self.align_side  # raio a -90° (perpendicular)
+        b = self.align_diag  # raio a -45° (diagonal)
 
-        # ── Controle P: erro = WALL_TARGET - dist_R ──
-        error = self.WALL_TARGET - R
-        az = error * self.KP_WALL
-        az = max(-self.AZ_CLAMP, min(az, self.AZ_CLAMP))
-        twist.angular.z = az
+        if a < self.RIGHT_PRESENT and b < self.RANGE_CAP - 0.1:
+            # Pontos onde os raios atingem a parede:
+            #   P_side = (0, -a)                          (raio a -90°)
+            #   P_diag = (b*cos45, -b*sin45)              (raio a -45°)
+            # Vetor da parede: P_diag - P_side
+            #   dx = b*cos45,  dy = a - b*sin45
+            # Se paralelo → dy = 0. Desvio → heading_error = atan2(dy, dx)
+            dx = b * 0.7071
+            dy = a - b * 0.7071
+            heading_error = math.atan2(dy, dx)
+            az = self.ALIGN_KP * heading_error
+            twist.angular.z = max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
+        else:
+            twist.angular.z = 0.0
 
-        # Log periódico (a cada ~2 segundos)
         if self.loop_count % 20 == 0:
             self.get_logger().info(
-                f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  FR={FR:.2f}m  '
-                f'erro={error:+.3f}  az={twist.angular.z:+.3f}')
+                f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  '
+                f'side={a:.2f}m  diag={b:.2f}m  az={twist.angular.z:+.3f}')
 
     # ──────────────────────────────────────────────────────────────────
     # ESTADO: OUTER_CORNER (Quina à Direita)
     # ──────────────────────────────────────────────────────────────────
 
-    def _state_outer_corner(self, twist: Twist, F: float, R: float):
+    def _state_outer_corner(self, twist: Twist, F: float):
         """
         A parede direita sumiu — estamos numa quina externa.
         1) Avança reto 0.3m para que o eixo traseiro passe da quina.
@@ -361,7 +368,7 @@ class MazeNavigator(Node):
     # ESTADO: TURNING (Giro Controlado por Odometria)
     # ──────────────────────────────────────────────────────────────────
 
-    def _state_turning(self, twist: Twist, F: float, R: float):
+    def _state_turning(self, twist: Twist):
         """
         Gira no lugar (linear.x = 0) na direção planejada até atingir
         target_yaw com tolerância de ±0.05 rad.
@@ -371,6 +378,7 @@ class MazeNavigator(Node):
         if abs(error) < self.YAW_TOLERANCE:
             # ── Giro concluído → voltar para FOLLOW_WALL ──
             self.state = 'FOLLOW_WALL'
+            self.wall_found = False  # re-detectar parede antes de habilitar OUTER_CORNER
             self.get_logger().info(
                 f'[NAV] TURNING concluído → FOLLOW_WALL  '
                 f'yaw={math.degrees(self.current_yaw):.1f}°  '
