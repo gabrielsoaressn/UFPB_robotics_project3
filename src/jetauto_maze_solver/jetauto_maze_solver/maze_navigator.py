@@ -5,10 +5,11 @@ Maze Navigator — Máquina de Estados para Regra da Mão Direita (Robô Diferen
 Restrição absoluta: linear.y = 0.0 SEMPRE.
 
 Estados:
-  FOLLOW_WALL   → Seguir parede direita com controle proporcional + zona morta
-  INNER_CORNER  → Frente bloqueada → parar e girar 90° à esquerda (via TURNING)
-  OUTER_CORNER  → Parede direita sumiu → avançar 0.3m reto, depois girar 90° à direita
-  TURNING       → Giro controlado por odometria até atingir target_yaw
+  INITIAL_STRAIGHT → Largada segura: vai reto até frente bloqueada
+  FOLLOW_WALL      → Seguir parede direita com correção de heading + controle P
+  INNER_CORNER     → Frente bloqueada → parar e girar 90° à esquerda (via TURNING)
+  OUTER_CORNER     → Parede direita sumiu → avançar 0.3m reto, depois girar 90° à direita
+  TURNING          → Giro controlado por odometria até atingir target_yaw
 
 Tópicos:
   Assina: /jetauto/lidar/scan, /odometry/filtered
@@ -57,19 +58,22 @@ class MazeNavigator(Node):
     # Direita: setor de -100° a -50° (ângulos negativos = lado direito)
     RIGHT_LO = math.radians(-100)
     RIGHT_HI = math.radians(-50)
+    # Diagonal Direita Frontal: setor de -50° a -30° (look-ahead para alinhamento)
+    FRONT_RIGHT_LO = math.radians(-50)
+    FRONT_RIGHT_HI = math.radians(-30)
 
     # ── Limiares de distância (metros) ─────────────────────────────
     FRONT_BLOCKED = 0.6     # frente bloqueada → INNER_CORNER
     RIGHT_PRESENT = 0.8     # considera parede presente à direita
     RIGHT_LOST    = 0.85    # parede sumiu → OUTER_CORNER
-    DEADZONE_LO   = 0.35    # zona morta inferior (m)
-    DEADZONE_HI   = 0.45    # zona morta superior (m)
+    WALL_TARGET   = 0.40    # distância alvo da parede direita (m)
 
     # ── Velocidades ────────────────────────────────────────────────
     FORWARD_SPEED = 0.15    # m/s linear para frente
     TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
     KP_WALL       = 0.5     # ganho proporcional suave para seguir parede
-    AZ_CLAMP      = 0.2     # limite máximo de correção angular em FOLLOW_WALL
+    AZ_CLAMP      = 0.15    # limite máximo de correção angular em FOLLOW_WALL
+    HEADING_CORR  = 0.2     # correção angular quando nariz mergulha na parede
 
     # ── OUTER_CORNER: distância de avanço antes de girar ───────────
     ADVANCE_DIST = 0.3      # metros
@@ -99,6 +103,7 @@ class MazeNavigator(Node):
         # ── Dados do LiDAR ──
         self.front_dist = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
+        self.front_right_dist = self.RANGE_CAP
         self.scan_ready = False
 
         # ── Dados da odometria ──
@@ -108,7 +113,7 @@ class MazeNavigator(Node):
         self.odom_ready = False
 
         # ── Máquina de Estados ──
-        self.state = 'FOLLOW_WALL'
+        self.state = 'INITIAL_STRAIGHT'
         self.target_yaw = 0.0         # yaw alvo para o estado TURNING
         self.turn_direction = 0.0     # +1.0 = esquerda, -1.0 = direita
         self.advance_start_x = 0.0   # snapshot de odom para OUTER_CORNER
@@ -164,6 +169,7 @@ class MazeNavigator(Node):
 
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
+        self.front_right_dist = sector_min(self.FRONT_RIGHT_LO, self.FRONT_RIGHT_HI)
         self.scan_ready = True
 
     # ══════════════════════════════════════════════════════════════════
@@ -178,6 +184,7 @@ class MazeNavigator(Node):
         self.loop_count += 1
         F = self.front_dist
         R = self.right_dist
+        FR = self.front_right_dist
 
         # Marca primeira detecção de parede (habilita OUTER_CORNER)
         if not self.wall_found and R < self.RIGHT_PRESENT:
@@ -190,25 +197,62 @@ class MazeNavigator(Node):
         twist.linear.y = 0.0
 
         # Despacha para o estado atual
-        if self.state == 'TURNING':
+        if self.state == 'INITIAL_STRAIGHT':
+            self._state_initial_straight(twist, F)
+        elif self.state == 'TURNING':
             self._state_turning(twist, F, R)
         elif self.state == 'OUTER_CORNER':
             self._state_outer_corner(twist, F, R)
         else:
             # FOLLOW_WALL é o estado padrão
-            self._state_follow_wall(twist, F, R)
+            self._state_follow_wall(twist, F, R, FR)
 
         # Publica o comando de velocidade
         self.cmd_pub.publish(twist)
 
     # ──────────────────────────────────────────────────────────────────
+    # ESTADO: INITIAL_STRAIGHT (Largada Segura)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _state_initial_straight(self, twist: Twist, F: float):
+        """
+        Largada: vai puramente reto ignorando paredes laterais.
+        Quando a frente bloqueia (< 0.6m), entra em INNER_CORNER (giro esquerda).
+        """
+
+        if F <= self.FRONT_BLOCKED:
+            self.target_yaw = normalize_angle(
+                self.current_yaw + math.pi / 2.0)
+            self.turn_direction = 1.0
+            self.state = 'TURNING'
+            self.get_logger().info(
+                f'[NAV] INITIAL_STRAIGHT → TURNING esquerda  '
+                f'F={F:.2f}m  target_yaw={math.degrees(self.target_yaw):.1f}°')
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            return
+
+        twist.linear.x = self.FORWARD_SPEED
+        twist.angular.z = 0.0
+
+        if self.loop_count % 20 == 0:
+            self.get_logger().info(
+                f'[NAV] INITIAL_STRAIGHT  F={F:.2f}m  (indo reto)')
+
+    # ──────────────────────────────────────────────────────────────────
     # ESTADO: FOLLOW_WALL (Padrão)
     # ──────────────────────────────────────────────────────────────────
 
-    def _state_follow_wall(self, twist: Twist, F: float, R: float):
+    def _state_follow_wall(self, twist: Twist, F: float, R: float, FR: float):
         """
-        Seguir parede direita com controle proporcional suave.
-        Zona morta entre 0.35m e 0.45m impede oscilação (ping-pong).
+        Seguir parede direita com correção de heading (look-ahead) e controle P.
+
+        Usa duas leituras:
+          R  — distância perpendicular à direita (~-90°)
+          FR — diagonal direita frontal (~-45° a -30°)
+
+        Se o nariz estiver mergulhando na parede (FR ≈ R), força correção de
+        alinhamento. Caso contrário, aplica controle P com clamp suave.
 
         Verifica transições:
           - Frente bloqueada (F <= 0.6m) → INNER_CORNER → TURNING esquerda
@@ -217,16 +261,14 @@ class MazeNavigator(Node):
 
         # ── PRIORIDADE MÁXIMA: Frente bloqueada → INNER_CORNER ──
         if F <= self.FRONT_BLOCKED:
-            # Calcula yaw alvo: +90° (esquerda)
             self.target_yaw = normalize_angle(
                 self.current_yaw + math.pi / 2.0)
-            self.turn_direction = 1.0  # esquerda (angular.z positivo)
+            self.turn_direction = 1.0
             self.state = 'TURNING'
             self.get_logger().info(
                 f'[NAV] Entrando em INNER_CORNER → Freando e Girando à Esquerda  '
                 f'F={F:.2f}m  R={R:.2f}m  '
                 f'target_yaw={math.degrees(self.target_yaw):.1f}°')
-            # Primeiro ciclo: freio total
             twist.linear.x = 0.0
             twist.angular.z = 0.0
             return
@@ -234,7 +276,6 @@ class MazeNavigator(Node):
         # ── Parede direita sumiu → OUTER_CORNER ──
         if self.wall_found and R > self.RIGHT_LOST:
             self.state = 'OUTER_CORNER'
-            # Salva posição atual para medir avanço de 0.3m
             self.advance_start_x = self.odom_x
             self.advance_start_y = self.odom_y
             self.get_logger().info(
@@ -244,28 +285,29 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        # ── Comportamento normal: seguir parede com controle P + zona morta ──
+        # ── Correção de Heading (look-ahead) ──
+        # Se FR < R + 0.1 → nariz mergulhando na parede → forçar correção
         twist.linear.x = self.FORWARD_SPEED
 
-        if R < self.DEADZONE_LO:
-            # Muito perto da parede → virar à esquerda (angular.z > 0)
-            error = self.DEADZONE_LO - R
-            az = self.KP_WALL * error
-            twist.angular.z = min(az, self.AZ_CLAMP)
-        elif R > self.DEADZONE_HI:
-            # Muito longe da parede → virar à direita (angular.z < 0)
-            error = self.DEADZONE_HI - R
-            az = self.KP_WALL * error
-            twist.angular.z = max(az, -self.AZ_CLAMP)
-        else:
-            # Dentro da zona morta → reto, sem correção
-            twist.angular.z = 0.0
+        if FR < R + 0.10:
+            twist.angular.z = self.HEADING_CORR
+            if self.loop_count % 20 == 0:
+                self.get_logger().info(
+                    f'[NAV] FOLLOW_WALL HEADING_CORR  F={F:.2f}m  R={R:.2f}m  '
+                    f'FR={FR:.2f}m  az={twist.angular.z:+.3f}')
+            return
+
+        # ── Controle P: erro = WALL_TARGET - dist_R ──
+        error = self.WALL_TARGET - R
+        az = error * self.KP_WALL
+        az = max(-self.AZ_CLAMP, min(az, self.AZ_CLAMP))
+        twist.angular.z = az
 
         # Log periódico (a cada ~2 segundos)
         if self.loop_count % 20 == 0:
             self.get_logger().info(
-                f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  '
-                f'vx={twist.linear.x:.2f}  az={twist.angular.z:+.3f}')
+                f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  FR={FR:.2f}m  '
+                f'erro={error:+.3f}  az={twist.angular.z:+.3f}')
 
     # ──────────────────────────────────────────────────────────────────
     # ESTADO: OUTER_CORNER (Quina à Direita)
