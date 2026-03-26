@@ -4,11 +4,16 @@ Maze Navigator — Centro do Corredor (Robô Omnidirecional)
 
 O robô usa o LiDAR para medir as distâncias às paredes esquerda e direita
 e emprega linear.y para se manter centrado no corredor enquanto avança.
-Quando a frente está bloqueada, a câmera determina a direção do giro:
-  Vermelho → esquerda  |  Verde → direita  |  Sem cor → lado com mais espaço
+Quando a frente está bloqueada, entra em COLOR_CHECK (para 0.5 s, amostra a cor)
+e depois gira na direção indicada pela parede:
+  Vermelho → esquerda  |  Verde → direita  |  Sem cor → célula menos visitada
+
+Anti-backtracking: mantém um mapa de células visitadas (grid 0.4 m)
+e, quando não há cor, prefere a direção com menos células visitadas à frente.
 
 Estados:
   FOLLOW_CORRIDOR → avança, centraliza lateralmente, corrige heading
+  COLOR_CHECK     → para o robô e amostra a cor por 0.5 s para decisão fiável
   TURNING         → giro no lugar controlado por odometria
 
 Tópicos:
@@ -17,6 +22,7 @@ Tópicos:
 """
 
 import math
+from collections import Counter
 import numpy as np
 import cv2
 import rclpy
@@ -59,37 +65,46 @@ class MazeNavigator(Node):
     RIGHT_LO = math.radians(-110)
     RIGHT_HI = math.radians(-70)
 
-    # Raios individuais para cálculo de heading (dois por parede)
-    R_SIDE_ANGLE = math.radians(-90)   # perpendicular à parede direita
-    R_DIAG_ANGLE = math.radians(-45)   # diagonal frente-direita
-    L_SIDE_ANGLE = math.radians(90)    # perpendicular à parede esquerda
-    L_DIAG_ANGLE = math.radians(45)    # diagonal frente-esquerda
+    # Raios individuais para cálculo de heading
+    R_SIDE_ANGLE = math.radians(-90)
+    R_DIAG_ANGLE = math.radians(-45)
+    L_SIDE_ANGLE = math.radians(90)
+    L_DIAG_ANGLE = math.radians(45)
 
     # ── Limiares de distância (metros) ─────────────────────────────
-    FRONT_BLOCKED = 0.5     # frente bloqueada → escolhe direção e gira
-    WALL_DETECT   = 1.2     # distância máxima para considerar parede presente
-    TARGET_SIDE   = 0.4     # distância desejada à parede (um só lado)
+    FRONT_BLOCKED = 0.5
+    WALL_DETECT   = 1.2     # considera parede presente se < este valor
+    TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
 
     # ── Controle lateral — linear.y ─────────────────────────────────
-    # Positivo = mover para a esquerda (convenção ROS, y aponta para esquerda)
-    KP_LAT    = 0.3     # ganho proporcional
-    LAT_CLAMP = 0.15    # velocidade lateral máxima (m/s)
+    KP_LAT    = 0.15    # ganho proporcional (reduzido para suavidade)
+    LAT_CLAMP = 0.10    # velocidade lateral máxima (m/s)
+    LAT_ALPHA = 0.25    # coef. de suavização EMA (menor = mais suave)
 
     # ── Correção de heading — angular.z ─────────────────────────────
     ALIGN_KP    = 1.5
-    ALIGN_CLAMP = 0.1   # rad/s máximo de correção
+    ALIGN_CLAMP = 0.1
 
     # ── Velocidades ─────────────────────────────────────────────────
-    FORWARD_SPEED = 0.15    # m/s para frente
-    TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
+    FORWARD_SPEED = 0.15
+    TURN_SPEED    = 0.4
     YAW_TOLERANCE = 0.05    # rad (~2.9°)
 
     # ── LiDAR ───────────────────────────────────────────────────────
     RANGE_CAP       = 3.0
     LIDAR_MIN_VALID = 0.15
 
+    # ── COLOR_CHECK ─────────────────────────────────────────────────
+    # Número de ciclos (10 Hz) em que o robô fica parado amostrado a cor
+    # antes de decidir a direção do giro. 5 ciclos = 0.5 s.
+    COLOR_CHECK_CYCLES = 5
+
+    # ── Anti-backtracking (células visitadas) ───────────────────────
+    CELL_SIZE       = 0.4   # tamanho da célula do grid (metros)
+    BACKTRACK_DISTS = (1.0, 1.5, 2.0)  # distâncias de projeção para avaliação
+
     # ── Câmera — faixas HSV ─────────────────────────────────────────
-    COLOR_MIN_AREA_FRAC = 0.05  # área mínima relativa da cor na imagem
+    COLOR_MIN_AREA_FRAC = 0.05
     RED_LOWER1  = np.array([0,   80,  50])
     RED_UPPER1  = np.array([10,  255, 255])
     RED_LOWER2  = np.array([170, 80,  50])
@@ -112,23 +127,33 @@ class MazeNavigator(Node):
         self.front_dist = self.RANGE_CAP
         self.left_dist  = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
-        self.r_side = self.RANGE_CAP  # raio a -90°
-        self.r_diag = self.RANGE_CAP  # raio a -45°
-        self.l_side = self.RANGE_CAP  # raio a +90°
-        self.l_diag = self.RANGE_CAP  # raio a +45°
+        self.r_side = self.RANGE_CAP
+        self.r_diag = self.RANGE_CAP
+        self.l_side = self.RANGE_CAP
+        self.l_diag = self.RANGE_CAP
         self.scan_ready = False
 
         # ── Odometria ──
+        self.odom_x = 0.0
+        self.odom_y = 0.0
         self.current_yaw = 0.0
         self.odom_ready = False
 
         # ── Câmera ──
         self.detected_color = None   # 'vermelho', 'verde' ou None
 
+        # ── Controle lateral suavizado ──
+        self.lat_cmd = 0.0   # valor filtrado por EMA
+
+        # ── Anti-backtracking ──
+        self.visited_cells: set = set()
+
         # ── Máquina de estados ──
         self.state = 'FOLLOW_CORRIDOR'
-        self.target_yaw     = 0.0
-        self.turn_direction = 0.0   # +1 = esquerda, -1 = direita
+        self.target_yaw      = 0.0
+        self.turn_direction  = 0.0   # +1 = esquerda, -1 = direita
+        self.color_check_count   = 0
+        self.color_check_samples = []
         self.loop_count = 0
 
         self.get_logger().info(
@@ -139,6 +164,8 @@ class MazeNavigator(Node):
     # ══════════════════════════════════════════════════════════════════
 
     def _odom_cb(self, msg: Odometry):
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         self.odom_ready = True
 
@@ -207,42 +234,54 @@ class MazeNavigator(Node):
     # Cálculos de controle
     # ══════════════════════════════════════════════════════════════════
 
-    def _choose_turn(self):
+    def _pos_to_cell(self, x: float, y: float):
+        return (math.floor(x / self.CELL_SIZE), math.floor(y / self.CELL_SIZE))
+
+    def _visited_score(self, new_yaw: float) -> int:
         """
-        Decide a direção do giro quando a frente está bloqueada.
+        Conta quantas das células projetadas à frente (na direção new_yaw)
+        já foram visitadas. Quanto menor, menos explorada é essa direção.
+        """
+        score = 0
+        for dist in self.BACKTRACK_DISTS:
+            px = self.odom_x + dist * math.cos(new_yaw)
+            py = self.odom_y + dist * math.sin(new_yaw)
+            if self._pos_to_cell(px, py) in self.visited_cells:
+                score += 1
+        return score
+
+    def _choose_turn(self, color_decision: str):
+        """
+        Decide a direção do giro.
 
         Prioridade:
-          1. Câmera detectou VERMELHO → esquerda
-          2. Câmera detectou VERDE    → direita
-          3. Sem cor: vira para o lado com maior espaço lateral
+          1. VERMELHO → esquerda (+90°)
+          2. VERDE    → direita  (-90°)
+          3. Sem cor  → direção com menor score de células visitadas
+                        (anti-backtracking). Empate: esquerda.
         """
-        color = self.detected_color
-        if color == 'vermelho':
+        if color_decision == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
             return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif color == 'verde':
+        elif color_decision == 'verde':
             target = normalize_angle(self.current_yaw - math.pi / 2.0)
             return target, -1.0, 'direita (parede VERDE)'
         else:
-            # Sem indicação de cor: prefere o lado com mais espaço
-            if self.left_dist >= self.right_dist:
-                target = normalize_angle(self.current_yaw + math.pi / 2.0)
-                return target, 1.0, 'esquerda (mais espaço)'
+            yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
+            yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
+            score_L = self._visited_score(yaw_L)
+            score_R = self._visited_score(yaw_R)
+            if score_L <= score_R:
+                return yaw_L, 1.0, f'esquerda (visitadas: L={score_L} R={score_R})'
             else:
-                target = normalize_angle(self.current_yaw - math.pi / 2.0)
-                return target, -1.0, 'direita (mais espaço)'
+                return yaw_R, -1.0, f'direita (visitadas: L={score_L} R={score_R})'
 
     def _lateral_correction(self) -> float:
         """
-        Calcula linear.y para centralizar o robô no corredor.
+        Calcula o erro lateral bruto para centralizar no corredor.
+        A suavização EMA é aplicada no loop de controle.
 
         Convenção ROS: linear.y > 0 → move para esquerda.
-
-        Casos:
-          Ambas as paredes: centraliza entre elas.
-          Só parede direita: mantém TARGET_SIDE de distância.
-          Só parede esquerda: mantém TARGET_SIDE de distância.
-          Nenhuma parede: sem correção lateral.
         """
         L = self.left_dist
         R = self.right_dist
@@ -250,54 +289,41 @@ class MazeNavigator(Node):
         right_wall = R < self.WALL_DETECT
 
         if left_wall and right_wall:
-            # (L - R) / 2 > 0 → mais próximo da direita → mover esquerda ✓
             error = (L - R) / 2.0
         elif right_wall:
-            # TARGET_SIDE - R > 0 quando muito perto da direita → mover esquerda ✓
-            error = self.TARGET_SIDE - R
+            error = self.TARGET_SIDE - R   # positivo = muito perto da direita → move esq.
         elif left_wall:
-            # L - TARGET_SIDE < 0 quando muito perto da esquerda → mover direita ✓
-            error = L - self.TARGET_SIDE
+            error = L - self.TARGET_SIDE   # negativo = muito perto da esquerda → move dir.
         else:
             error = 0.0
 
-        return max(-self.LAT_CLAMP, min(self.KP_LAT * error, self.LAT_CLAMP))
+        raw = max(-self.LAT_CLAMP, min(self.KP_LAT * error, self.LAT_CLAMP))
+        return raw
 
     def _heading_correction(self) -> float:
         """
         Calcula angular.z para manter o robô alinhado com o corredor.
+        Usa geometria de dois raios por parede; combina ambas se presentes.
 
-        Usa geometria de dois raios por parede para derivar o ângulo real
-        do robô em relação à superfície. Combina as correções de ambas
-        as paredes presentes (média).
-
-        Geometria (frame do robô: x=frente, y=esquerda):
-          Parede direita — raios a -90° (a) e -45° (b):
-            Vetor da parede: dx = b·cos45, dy = a − b·sin45
-            Erro de heading = atan2(dy, dx)
-          Parede esquerda — raios a +90° (c) e +45° (d):
-            Vetor da parede: dx = d·cos45, dy = d·sin45 − c
-            Erro de heading = atan2(dy, dx)   ← mesmo sinal, geometria simétrica
+        Parede direita (raios -90° e -45°):
+          Vetor da parede: dx = b·cos45, dy = a − b·sin45
+        Parede esquerda (raios +90° e +45°):
+          Vetor da parede: dx = d·cos45, dy = d·sin45 − c
         """
         corrections = []
 
         a, b = self.r_side, self.r_diag
         if a < self.WALL_DETECT and b < self.RANGE_CAP - 0.1:
-            dy = a - b * 0.7071
-            dx = b * 0.7071
-            corrections.append(math.atan2(dy, dx))
+            corrections.append(math.atan2(a - b * 0.7071, b * 0.7071))
 
         c, d = self.l_side, self.l_diag
         if c < self.WALL_DETECT and d < self.RANGE_CAP - 0.1:
-            dy = d * 0.7071 - c
-            dx = d * 0.7071
-            corrections.append(math.atan2(dy, dx))
+            corrections.append(math.atan2(d * 0.7071 - c, d * 0.7071))
 
         if not corrections:
             return 0.0
 
-        heading_error = sum(corrections) / len(corrections)
-        az = self.ALIGN_KP * heading_error
+        az = self.ALIGN_KP * (sum(corrections) / len(corrections))
         return max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
 
     # ══════════════════════════════════════════════════════════════════
@@ -309,9 +335,15 @@ class MazeNavigator(Node):
             return
 
         self.loop_count += 1
+
+        # Registra célula atual como visitada
+        self.visited_cells.add(self._pos_to_cell(self.odom_x, self.odom_y))
+
         twist = Twist()
 
-        if self.state == 'TURNING':
+        if self.state == 'COLOR_CHECK':
+            self._state_color_check(twist)
+        elif self.state == 'TURNING':
             self._state_turning(twist)
         else:
             self._state_follow_corridor(twist)
@@ -325,25 +357,29 @@ class MazeNavigator(Node):
     def _state_follow_corridor(self, twist: Twist):
         """
         Avança reto enquanto:
-          1. linear.y centraliza lateralmente no corredor
-          2. angular.z mantém o heading paralelo às paredes
+          linear.y (suavizado) centraliza no corredor
+          angular.z mantém heading paralelo às paredes
 
-        Transição: frente bloqueada → consulta câmera → TURNING
+        Transição: frente bloqueada → COLOR_CHECK
         """
         if self.front_dist <= self.FRONT_BLOCKED:
-            self.target_yaw, self.turn_direction, desc = self._choose_turn()
-            self.state = 'TURNING'
+            self.state = 'COLOR_CHECK'
+            self.color_check_count   = 0
+            self.color_check_samples = []
+            self.lat_cmd = 0.0  # zera suavização ao parar
             self.get_logger().info(
-                f'[NAV] FOLLOW_CORRIDOR → TURNING {desc}  '
-                f'F={self.front_dist:.2f}m  '
-                f'target={math.degrees(self.target_yaw):.1f}°')
+                f'[NAV] FOLLOW_CORRIDOR → COLOR_CHECK  F={self.front_dist:.2f}m')
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
             twist.angular.z = 0.0
             return
 
+        raw_lat = self._lateral_correction()
+        # Filtro EMA: suaviza oscilações laterais
+        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * raw_lat
+
         twist.linear.x  = self.FORWARD_SPEED
-        twist.linear.y  = self._lateral_correction()
+        twist.linear.y  = self.lat_cmd
         twist.angular.z = self._heading_correction()
 
         if self.loop_count % 20 == 0:
@@ -355,6 +391,48 @@ class MazeNavigator(Node):
                 f'cor={self.detected_color}')
 
     # ──────────────────────────────────────────────────────────────────
+    # ESTADO: COLOR_CHECK
+    # ──────────────────────────────────────────────────────────────────
+
+    def _state_color_check(self, twist: Twist):
+        """
+        Para o robô e amostra a cor da câmera por COLOR_CHECK_CYCLES ciclos.
+        Ao final usa a cor mais frequente para decidir a direção do giro.
+
+        Caso a frente se abra novamente (falso positivo), cancela e volta
+        para FOLLOW_CORRIDOR.
+        """
+        # Segurança: frente abriu → cancelar
+        if self.front_dist > self.FRONT_BLOCKED + 0.1:
+            self.state = 'FOLLOW_CORRIDOR'
+            self.get_logger().info('[NAV] COLOR_CHECK cancelado (frente abriu)')
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+            return
+
+        # Mantém robô parado
+        twist.linear.x  = 0.0
+        twist.linear.y  = 0.0
+        twist.angular.z = 0.0
+
+        # Coleta amostra de cor
+        self.color_check_samples.append(self.detected_color)
+        self.color_check_count += 1
+
+        if self.color_check_count < self.COLOR_CHECK_CYCLES:
+            return  # ainda coletando amostras
+
+        # ── Decisão: cor mais frequente nas amostras ──
+        counts = Counter(self.color_check_samples)
+        color_decision = counts.most_common(1)[0][0]  # None também conta
+
+        self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
+        self.state = 'TURNING'
+        self.get_logger().info(
+            f'[NAV] COLOR_CHECK → TURNING {desc}  '
+            f'amostras={dict(counts)}  '
+            f'target={math.degrees(self.target_yaw):.1f}°')
+
+    # ──────────────────────────────────────────────────────────────────
     # ESTADO: TURNING
     # ──────────────────────────────────────────────────────────────────
 
@@ -364,6 +442,7 @@ class MazeNavigator(Node):
 
         if abs(error) < self.YAW_TOLERANCE:
             self.state = 'FOLLOW_CORRIDOR'
+            self.lat_cmd = 0.0  # zera suavização ao sair do giro
             self.get_logger().info(
                 f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
                 f'yaw={math.degrees(self.current_yaw):.1f}°  '
