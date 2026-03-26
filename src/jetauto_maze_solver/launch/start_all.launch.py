@@ -3,7 +3,8 @@ Single launch file that starts everything:
   1. Robot description (URDF)
   2. Gazebo simulation with labyrinth world
   3. EKF (odometry filtering)
-  4. Maze navigator + Color wall counter
+  4. RViz (LaserScan + Map do SLAM)
+  5. SLAM + Maze navigator + Color wall counter
 """
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, TimerAction
@@ -16,6 +17,8 @@ import os
 def generate_launch_description():
     robotics_subject_dir = get_package_share_directory('robotics_subject')
     maze_solver_dir = get_package_share_directory('jetauto_maze_solver')
+
+    rviz_config = os.path.join(maze_solver_dir, 'rviz', 'maze_solver.rviz')
 
     # 1. Robot description (joint/robot state publishers)
     robot_description = IncludeLaunchDescription(
@@ -43,9 +46,24 @@ def generate_launch_description():
         ],
     )
 
-    # 4. Maze solver nodes (delayed 5s to let simulation stabilise)
+    # 4. RViz com config de LaserScan + Map (delayed 4s para o robot_description estar pronto)
+    rviz = TimerAction(
+        period=4.0,
+        actions=[
+            Node(
+                package='rviz2',
+                executable='rviz2',
+                name='rviz2',
+                arguments=['-d', rviz_config],
+                parameters=[{'use_sim_time': True}],
+                output='screen',
+            ),
+        ],
+    )
+
+    # 5. SLAM + Maze solver nodes (delayed 6s para o Gazebo e EKF estabilizarem)
     maze_solver = TimerAction(
-        period=5.0,
+        period=6.0,
         actions=[
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
@@ -59,5 +77,6 @@ def generate_launch_description():
         robot_description,
         simulation,
         ekf,
+        rviz,
         maze_solver,
     ])

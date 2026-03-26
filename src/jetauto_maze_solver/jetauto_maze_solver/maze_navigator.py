@@ -20,7 +20,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from geometry_msgs.msg import Twist
 
 
@@ -71,18 +71,18 @@ class MazeNavigator(Node):
     # ── Velocidades ────────────────────────────────────────────────
     FORWARD_SPEED = 0.15    # m/s linear para frente
     TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
-    KP_WALL       = 0.5     # ganho proporcional para distância da parede direita
-    AZ_CLAMP      = 0.15    # limite do termo de distância
-    KP_YAW        = 0.6     # ganho proporcional para manter heading de referência
-    AZ_YAW_CLAMP  = 0.12    # limite do termo de heading
-    WALL_ANGLE_GAIN = 0.3   # ganho para correção de ângulo da parede (R vs FR)
+    KP_WALL      = 0.5     # ganho proporcional para distância da parede direita
+    AZ_CLAMP     = 0.15    # limite do termo de distância
+    KP_YAW       = 0.6     # ganho proporcional para manter heading de referência
+    AZ_YAW_CLAMP = 0.12    # limite do termo de heading
 
     # ── OUTER_CORNER: distância de avanço antes de girar ───────────
     ADVANCE_DIST = 0.3      # metros
 
-    # ── Memória de caminho: grade de células visitadas ──────────────
-    CELL_SIZE   = 0.5       # tamanho da célula em metros
-    YAW_BUCKETS = 4         # quantiza heading em 4 direções cardeais
+    # ── Memória de caminho: distâncias de verificação no mapa SLAM ──
+    # Verifica esses offsets à frente na direção da virada antes de entrar
+    # em OUTER_CORNER — se qualquer célula já for conhecida (free), bloqueia.
+    REVISIT_CHECK_DISTS = (0.5, 1.0, 1.5)  # metros
 
     # ── TURNING: tolerância angular ────────────────────────────────
     YAW_TOLERANCE = 0.05    # radianos (~2.9°)
@@ -133,10 +133,14 @@ class MazeNavigator(Node):
         # Atualizado toda vez que o robô termina um giro e entra em FOLLOW_WALL.
         self.reference_yaw = None
 
-        # ── Memória de caminho: células visitadas ──
-        # Cada entrada é (cell_x, cell_y, heading_bucket) — posição discreta
-        # mais direção quantizada em 4 quadrantes (N/L/S/O).
-        self.visited = set()
+        # ── Mapa SLAM ──
+        # Recebido via /map (OccupancyGrid). Usado para detectar regiões já
+        # exploradas e evitar que o robô volte por caminhos já percorridos.
+        self.slam_map = None
+
+        # Subscriber do mapa (registrado após o super().__init__)
+        self.create_subscription(
+            OccupancyGrid, '/map', self._map_cb, 10)
 
         # Contador para throttle de logs
         self.loop_count = 0
@@ -149,15 +153,35 @@ class MazeNavigator(Node):
     # Auxiliar: discretização para memória de caminho
     # ══════════════════════════════════════════════════════════════════
 
-    def _discretize(self, x: float, y: float, yaw: float) -> tuple:
+    def _map_cb(self, msg: OccupancyGrid):
+        """Armazena o mapa mais recente publicado pelo SLAM."""
+        self.slam_map = msg
+
+    def _cell_explored(self, wx: float, wy: float) -> bool:
         """
-        Converte posição contínua + heading em uma chave discreta.
-        Célula de CELL_SIZE metros; heading quantizado em 4 direções cardeais.
+        Verifica se a coordenada world (wx, wy) já foi explorada pelo SLAM.
+
+        O OccupancyGrid usa:
+          -1  → célula desconhecida (nunca visitada)
+           0  → livre (o robô já passou por aqui)
+          100 → ocupado (parede)
+
+        Retorna True se a célula for conhecida como livre (valor 0..49),
+        indicando que o robô já percorreu aquela região.
         """
-        cx = int(round(x / self.CELL_SIZE))
-        cy = int(round(y / self.CELL_SIZE))
-        bucket = int(round(normalize_angle(yaw) / (math.pi / 2))) % self.YAW_BUCKETS
-        return (cx, cy, bucket)
+        if self.slam_map is None:
+            return False
+
+        info = self.slam_map.info
+        col = int((wx - info.origin.position.x) / info.resolution)
+        row = int((wy - info.origin.position.y) / info.resolution)
+
+        if col < 0 or col >= info.width or row < 0 or row >= info.height:
+            return False
+
+        value = self.slam_map.data[row * info.width + col]
+        # Célula livre e conhecida → o robô já esteve aqui
+        return 0 <= value < 50
 
     # ══════════════════════════════════════════════════════════════════
     # Callbacks dos sensores
@@ -220,9 +244,6 @@ class MazeNavigator(Node):
             self.wall_found = True
             self.get_logger().info(
                 f'[NAV] Parede direita encontrada pela primeira vez (R={R:.2f}m)')
-
-        # Registra célula atual na memória de caminho
-        self.visited.add(self._discretize(self.odom_x, self.odom_y, self.current_yaw))
 
         # Cria mensagem de velocidade — linear.y = 0.0 SEMPRE
         twist = Twist()
@@ -301,19 +322,25 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        # ── Parede direita sumiu → verificar memória antes de entrar em OUTER_CORNER ──
+        # ── Parede direita sumiu → verificar mapa SLAM antes de entrar em OUTER_CORNER ──
         if self.wall_found and R > self.RIGHT_LOST:
             predicted_yaw = normalize_angle(self.current_yaw - math.pi / 2.0)
-            predicted_x   = self.odom_x + self.ADVANCE_DIST * math.cos(predicted_yaw)
-            predicted_y   = self.odom_y + self.ADVANCE_DIST * math.sin(predicted_yaw)
-            predicted_key = self._discretize(predicted_x, predicted_y, predicted_yaw)
+            # Consulta o mapa SLAM em múltiplas distâncias na direção da virada.
+            # Se alguma célula já for conhecida como livre, a região foi percorrida.
+            revisit = any(
+                self._cell_explored(
+                    self.odom_x + d * math.cos(predicted_yaw),
+                    self.odom_y + d * math.sin(predicted_yaw)
+                )
+                for d in self.REVISIT_CHECK_DISTS
+            )
 
-            if predicted_key in self.visited:
-                # Célula já visitada nessa direção → não vira à direita, continua reto
+            if revisit:
+                # Região já explorada → não vira à direita, continua reto
                 if self.loop_count % 20 == 0:
                     self.get_logger().warn(
-                        f'[NAV] OUTER_CORNER bloqueado por memória '
-                        f'(célula {predicted_key} já visitada) → continuando reto')
+                        '[NAV] OUTER_CORNER bloqueado pelo mapa SLAM '
+                        '(região já explorada) → continuando reto')
                 twist.linear.x = self.FORWARD_SPEED
                 twist.angular.z = 0.0
                 return
@@ -328,34 +355,29 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        # ── Controle de seguimento: três termos combinados ──
+        # ── Controle de seguimento: dois termos combinados ──
         twist.linear.x = self.FORWARD_SPEED
 
-        # Termo 1 — ângulo de parede: R (perpendicular) vs FR (diagonal ~40°)
-        # R - FR > 0 → nariz mergulhando na parede → corrige para esquerda (+az)
-        # R - FR < 0 → nariz saindo da parede    → corrige para direita  (-az)
-        wall_angle_error = R - FR
-        az_angle = max(-0.15, min(wall_angle_error * self.WALL_ANGLE_GAIN, 0.15))
-
-        # Termo 2 — distância à parede (controle P)
+        # Termo 1 — distância à parede direita (controle P)
         error_dist = self.WALL_TARGET - R
         az_dist = max(-self.AZ_CLAMP, min(error_dist * self.KP_WALL, self.AZ_CLAMP))
 
-        # Termo 3 — heading hold: ancora o robô no eixo do corredor
+        # Termo 2 — heading hold: ancora o robô no eixo do corredor atual.
+        # Evita deriva angular acumulada que faz o robô andar inclinado.
         if self.reference_yaw is not None:
             error_yaw = normalize_angle(self.reference_yaw - self.current_yaw)
             az_yaw = max(-self.AZ_YAW_CLAMP, min(error_yaw * self.KP_YAW, self.AZ_YAW_CLAMP))
         else:
             az_yaw = 0.0
 
-        twist.angular.z = az_angle + az_dist + az_yaw
+        twist.angular.z = az_dist + az_yaw
 
         # Log periódico (a cada ~2 segundos)
         if self.loop_count % 20 == 0:
             self.get_logger().info(
                 f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  FR={FR:.2f}m  '
-                f'az_angle={az_angle:+.3f}  az_dist={az_dist:+.3f}  '
-                f'az_yaw={az_yaw:+.3f}  az_total={twist.angular.z:+.3f}')
+                f'az_dist={az_dist:+.3f}  az_yaw={az_yaw:+.3f}  '
+                f'az_total={twist.angular.z:+.3f}')
 
     # ──────────────────────────────────────────────────────────────────
     # ESTADO: OUTER_CORNER (Quina à Direita)
