@@ -81,11 +81,12 @@ class MazeNavigator(Node):
     LIDAR_MIN_VALID = 0.15
 
     # ── Exploração de Fronteiras ───────────────────────────────────
-    FRONTIER_UPDATE_CYCLES = 40   # atualiza fronteira a cada 40 ciclos (4 s a 10 Hz)
-    FRONTIER_CLUSTER_SIZE  = 0.8  # raio de agrupamento de fronteiras (m)
-    FRONTIER_MIN_CLUSTER   = 3    # pontos mínimos por cluster para ser válido
-    FRONTIER_ARRIVAL_DIST  = 0.6  # considera chegado quando a menos de 0.6 m do alvo
-    MAP_SCAN_STEP          = 3    # passo de varredura do mapa (células) — performance
+    FRONTIER_UPDATE_CYCLES   = 40   # atualiza fronteira a cada 40 ciclos (4 s a 10 Hz)
+    FRONTIER_CLUSTER_SIZE    = 0.8  # raio de agrupamento de fronteiras (m)
+    FRONTIER_MIN_CLUSTER     = 3    # pontos mínimos por cluster para ser válido
+    FRONTIER_ARRIVAL_DIST    = 0.5  # considera chegado quando a menos de 0.5 m do alvo
+    FRONTIER_MIN_DIST        = 1.2  # ignora fronteiras a menos de 1.2 m do robô
+    MAP_SCAN_STEP            = 3    # passo de varredura do mapa (células) — performance
 
     def __init__(self):
         super().__init__('maze_navigator')
@@ -239,8 +240,18 @@ class MazeNavigator(Node):
         if not centroids:
             return None
 
+        # ── Filtra fronteiras muito próximas do robô ─────────────────
+        # Evita selecionar fronteiras que o robô já está em cima,
+        # o que causaria o loop "atingida → busca → mesma fronteira".
+        far = [c for c in centroids
+               if math.hypot(c[0] - self.odom_x,
+                              c[1] - self.odom_y) > self.FRONTIER_MIN_DIST]
+
+        # Se não há fronteiras distantes o suficiente, usa todas como fallback
+        candidates = far if far else centroids
+
         # ── Seleciona o centroide mais distante da origem (0, 0) ────
-        best = max(centroids, key=lambda c: math.hypot(c[0], c[1]))
+        best = max(candidates, key=lambda c: math.hypot(c[0], c[1]))
         return best
 
     # ══════════════════════════════════════════════════════════════════
