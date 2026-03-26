@@ -8,7 +8,6 @@
   <license>BSD-3-Clause</license>
 
   <depend>rclpy</depend>
-  <depend>slam_toolbox</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
