@@ -71,12 +71,18 @@ class MazeNavigator(Node):
     # ── Velocidades ────────────────────────────────────────────────
     FORWARD_SPEED = 0.15    # m/s linear para frente
     TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
-    KP_WALL       = 0.5     # ganho proporcional suave para seguir parede
-    AZ_CLAMP      = 0.15    # limite máximo de correção angular em FOLLOW_WALL
-    HEADING_CORR  = 0.2     # correção angular quando nariz mergulha na parede
+    KP_WALL       = 0.5     # ganho proporcional para distância da parede direita
+    AZ_CLAMP      = 0.15    # limite do termo de distância
+    KP_YAW        = 0.6     # ganho proporcional para manter heading de referência
+    AZ_YAW_CLAMP  = 0.12    # limite do termo de heading
+    WALL_ANGLE_GAIN = 0.3   # ganho para correção de ângulo da parede (R vs FR)
 
     # ── OUTER_CORNER: distância de avanço antes de girar ───────────
     ADVANCE_DIST = 0.3      # metros
+
+    # ── Memória de caminho: grade de células visitadas ──────────────
+    CELL_SIZE   = 0.5       # tamanho da célula em metros
+    YAW_BUCKETS = 4         # quantiza heading em 4 direções cardeais
 
     # ── TURNING: tolerância angular ────────────────────────────────
     YAW_TOLERANCE = 0.05    # radianos (~2.9°)
@@ -123,12 +129,35 @@ class MazeNavigator(Node):
         # evitando falso trigger na entrada do labirinto.
         self.wall_found = False
 
+        # ── Heading de referência (âncora angular do corredor atual) ──
+        # Atualizado toda vez que o robô termina um giro e entra em FOLLOW_WALL.
+        self.reference_yaw = None
+
+        # ── Memória de caminho: células visitadas ──
+        # Cada entrada é (cell_x, cell_y, heading_bucket) — posição discreta
+        # mais direção quantizada em 4 quadrantes (N/L/S/O).
+        self.visited = set()
+
         # Contador para throttle de logs
         self.loop_count = 0
 
         self.get_logger().info(
             '[NAV] ═══ Maze Navigator Iniciado ═══ '
             'Máquina de Estados — Regra da Mão Direita')
+
+    # ══════════════════════════════════════════════════════════════════
+    # Auxiliar: discretização para memória de caminho
+    # ══════════════════════════════════════════════════════════════════
+
+    def _discretize(self, x: float, y: float, yaw: float) -> tuple:
+        """
+        Converte posição contínua + heading em uma chave discreta.
+        Célula de CELL_SIZE metros; heading quantizado em 4 direções cardeais.
+        """
+        cx = int(round(x / self.CELL_SIZE))
+        cy = int(round(y / self.CELL_SIZE))
+        bucket = int(round(normalize_angle(yaw) / (math.pi / 2))) % self.YAW_BUCKETS
+        return (cx, cy, bucket)
 
     # ══════════════════════════════════════════════════════════════════
     # Callbacks dos sensores
@@ -192,6 +221,9 @@ class MazeNavigator(Node):
             self.get_logger().info(
                 f'[NAV] Parede direita encontrada pela primeira vez (R={R:.2f}m)')
 
+        # Registra célula atual na memória de caminho
+        self.visited.add(self._discretize(self.odom_x, self.odom_y, self.current_yaw))
+
         # Cria mensagem de velocidade — linear.y = 0.0 SEMPRE
         twist = Twist()
         twist.linear.y = 0.0
@@ -245,18 +277,14 @@ class MazeNavigator(Node):
 
     def _state_follow_wall(self, twist: Twist, F: float, R: float, FR: float):
         """
-        Seguir parede direita com correção de heading (look-ahead) e controle P.
-
-        Usa duas leituras:
-          R  — distância perpendicular à direita (~-90°)
-          FR — diagonal direita frontal (~-45° a -30°)
-
-        Se o nariz estiver mergulhando na parede (FR ≈ R), força correção de
-        alinhamento. Caso contrário, aplica controle P com clamp suave.
+        Seguir parede direita com três termos combinados:
+          1. az_angle — ângulo relativo à parede (R vs FR), substitui correção binária
+          2. az_dist  — controle P de distância à parede direita
+          3. az_yaw   — heading hold: mantém reference_yaw do corredor atual
 
         Verifica transições:
           - Frente bloqueada (F <= 0.6m) → INNER_CORNER → TURNING esquerda
-          - Parede sumiu (R > 0.85m)     → OUTER_CORNER → avanço + TURNING direita
+          - Parede sumiu (R > 0.85m)     → OUTER_CORNER (se célula destino nova)
         """
 
         # ── PRIORIDADE MÁXIMA: Frente bloqueada → INNER_CORNER ──
@@ -273,8 +301,23 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        # ── Parede direita sumiu → OUTER_CORNER ──
+        # ── Parede direita sumiu → verificar memória antes de entrar em OUTER_CORNER ──
         if self.wall_found and R > self.RIGHT_LOST:
+            predicted_yaw = normalize_angle(self.current_yaw - math.pi / 2.0)
+            predicted_x   = self.odom_x + self.ADVANCE_DIST * math.cos(predicted_yaw)
+            predicted_y   = self.odom_y + self.ADVANCE_DIST * math.sin(predicted_yaw)
+            predicted_key = self._discretize(predicted_x, predicted_y, predicted_yaw)
+
+            if predicted_key in self.visited:
+                # Célula já visitada nessa direção → não vira à direita, continua reto
+                if self.loop_count % 20 == 0:
+                    self.get_logger().warn(
+                        f'[NAV] OUTER_CORNER bloqueado por memória '
+                        f'(célula {predicted_key} já visitada) → continuando reto')
+                twist.linear.x = self.FORWARD_SPEED
+                twist.angular.z = 0.0
+                return
+
             self.state = 'OUTER_CORNER'
             self.advance_start_x = self.odom_x
             self.advance_start_y = self.odom_y
@@ -285,29 +328,34 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        # ── Correção de Heading (look-ahead) ──
-        # Se FR < R + 0.1 → nariz mergulhando na parede → forçar correção
+        # ── Controle de seguimento: três termos combinados ──
         twist.linear.x = self.FORWARD_SPEED
 
-        if FR < R + 0.10:
-            twist.angular.z = self.HEADING_CORR
-            if self.loop_count % 20 == 0:
-                self.get_logger().info(
-                    f'[NAV] FOLLOW_WALL HEADING_CORR  F={F:.2f}m  R={R:.2f}m  '
-                    f'FR={FR:.2f}m  az={twist.angular.z:+.3f}')
-            return
+        # Termo 1 — ângulo de parede: R (perpendicular) vs FR (diagonal ~40°)
+        # R - FR > 0 → nariz mergulhando na parede → corrige para esquerda (+az)
+        # R - FR < 0 → nariz saindo da parede    → corrige para direita  (-az)
+        wall_angle_error = R - FR
+        az_angle = max(-0.15, min(wall_angle_error * self.WALL_ANGLE_GAIN, 0.15))
 
-        # ── Controle P: erro = WALL_TARGET - dist_R ──
-        error = self.WALL_TARGET - R
-        az = error * self.KP_WALL
-        az = max(-self.AZ_CLAMP, min(az, self.AZ_CLAMP))
-        twist.angular.z = az
+        # Termo 2 — distância à parede (controle P)
+        error_dist = self.WALL_TARGET - R
+        az_dist = max(-self.AZ_CLAMP, min(error_dist * self.KP_WALL, self.AZ_CLAMP))
+
+        # Termo 3 — heading hold: ancora o robô no eixo do corredor
+        if self.reference_yaw is not None:
+            error_yaw = normalize_angle(self.reference_yaw - self.current_yaw)
+            az_yaw = max(-self.AZ_YAW_CLAMP, min(error_yaw * self.KP_YAW, self.AZ_YAW_CLAMP))
+        else:
+            az_yaw = 0.0
+
+        twist.angular.z = az_angle + az_dist + az_yaw
 
         # Log periódico (a cada ~2 segundos)
         if self.loop_count % 20 == 0:
             self.get_logger().info(
                 f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  FR={FR:.2f}m  '
-                f'erro={error:+.3f}  az={twist.angular.z:+.3f}')
+                f'az_angle={az_angle:+.3f}  az_dist={az_dist:+.3f}  '
+                f'az_yaw={az_yaw:+.3f}  az_total={twist.angular.z:+.3f}')
 
     # ──────────────────────────────────────────────────────────────────
     # ESTADO: OUTER_CORNER (Quina à Direita)
@@ -371,10 +419,13 @@ class MazeNavigator(Node):
         if abs(error) < self.YAW_TOLERANCE:
             # ── Giro concluído → voltar para FOLLOW_WALL ──
             self.state = 'FOLLOW_WALL'
+            # Salva heading atual como referência do novo corredor
+            self.reference_yaw = self.current_yaw
             self.get_logger().info(
                 f'[NAV] TURNING concluído → FOLLOW_WALL  '
                 f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                f'erro_final={math.degrees(error):.1f}°')
+                f'erro_final={math.degrees(error):.1f}°  '
+                f'reference_yaw={math.degrees(self.reference_yaw):.1f}°')
             twist.linear.x = 0.0
             twist.angular.z = 0.0
         else:
