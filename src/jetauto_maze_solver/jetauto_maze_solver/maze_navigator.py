@@ -273,38 +273,15 @@ class MazeNavigator(Node):
             self.get_logger().info(f'[NAV] Decisão: {desc}')
 
     def _state_turning(self, twist: Twist):
-        """
-        Fase 1: Gira cego usando odometria.
-        Fase 2: Faltando ~25 graus, tenta "grudar" na parede usando o LiDAR.
-        Fallback: Se não achar parede, conclui os 90 graus pela odometria.
-        """
+        """Gira pela odometria até atingir target_yaw."""
         odom_error = normalize_angle(self.target_yaw - self.current_yaw)
 
-        # Se já estiver a menos de 25 graus (0.43 rad) do alvo, tenta usar o LiDAR
-        if abs(odom_error) < math.radians(25):
-            wall_error = self._get_wall_alignment_error()
-
-            # Se achou uma parede lateral confiável, faz o "Fechamento Magnético"
-            if wall_error is not None:
-                if abs(wall_error) < self.YAW_TOLERANCE:
-                    self.state = 'FOLLOW_CORRIDOR'
-                    self.lat_cmd = 0.0
-                    twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-                    self.get_logger().info(
-                        f'[NAV] Giro finalizado pelo LiDAR! Erro real: {math.degrees(wall_error):.1f}°')
-                else:
-                    # Gira suavemente até a parede ficar 100% reta
-                    twist.linear.x = twist.linear.y = 0.0
-                    twist.angular.z = max(-self.TURN_SPEED, min(self.ALIGN_KP * wall_error, self.TURN_SPEED))
-                return
-
-        # Fallback (Odometria Pura): Usado no início do giro OU se não houver parede perto para se alinhar
         if abs(odom_error) < self.YAW_TOLERANCE:
             self.state = 'FOLLOW_CORRIDOR'
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             self.get_logger().info(
-                f'[NAV] Giro finalizado por Odometria (sem parede). Erro Odom: {math.degrees(odom_error):.1f}°')
+                f'[NAV] Giro finalizado. Erro: {math.degrees(odom_error):.1f}°')
         else:
             twist.linear.x = twist.linear.y = 0.0
             twist.angular.z = self.TURN_SPEED * self.turn_direction
