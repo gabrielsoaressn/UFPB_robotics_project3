@@ -160,6 +160,7 @@ class MazeNavigator(Node):
         self.turn_direction  = 0.0   # +1 = esquerda, -1 = direita
         self.color_check_count   = 0
         self.color_check_samples = []
+        self.consecutive_blocks  = 0   # giros seguidos com frente ainda bloqueada
         self.loop_count = 0
 
         self.get_logger().info(
