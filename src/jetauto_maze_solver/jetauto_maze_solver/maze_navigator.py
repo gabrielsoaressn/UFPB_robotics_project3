@@ -51,8 +51,8 @@ class MazeNavigator(Node):
 
     # Limiares de distância
     FRONT_BLOCKED = 0.60    # Espaço seguro para o chassi girar sem colisões
-    WALL_DETECT   = 1.2     
-    TARGET_SIDE   = 0.40    
+    WALL_DETECT   = 1.2
+    TARGET_SIDE   = 0.40
 
     # Controle lateral — linear.y (Suavizado)
     KP_LAT    = 0.15
@@ -64,16 +64,9 @@ class MazeNavigator(Node):
     ALIGN_CLAMP = 0.15
 
     # Velocidades
-    FORWARD_SPEED  = 0.15
-    TURN_MAX_SPEED = 0.35   # velocidade máxima de giro (proporcional)
-    TURN_MIN_SPEED = 0.10   # velocidade mínima para garantir chegada ao alvo
-    TURN_KP        = 2.0    # ganho proporcional do giro
-    YAW_TOLERANCE  = 0.05
-
-    # Centralização pós-curva
-    CENTER_LAT_TOL    = 0.03  # tolerância de erro lateral (m)
-    CENTER_HDG_TOL    = 0.04  # tolerância de erro de heading (rad)
-    MAX_CENTER_CYCLES = 30    # timeout (~3 s a 10 Hz)
+    FORWARD_SPEED = 0.15
+    TURN_SPEED    = 0.4
+    YAW_TOLERANCE = 0.05
 
     RANGE_CAP       = 3.0
     LIDAR_MIN_VALID = 0.15
@@ -96,7 +89,7 @@ class MazeNavigator(Node):
 
         self.create_subscription(LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
-        self.create_subscription(Image, '/jetauto/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, '/jetauto/cmd_vel', 10)
         self.bridge = CvBridge()
@@ -110,7 +103,6 @@ class MazeNavigator(Node):
         self.odom_x, self.odom_y, self.current_yaw = 0.0, 0.0, 0.0
 
         self.detected_color = None
-        self.last_seen_color = None   # cor vista ao passar por passagem lateral
         self.lat_cmd = 0.0
         self.visited_cells: set = set()
 
@@ -120,7 +112,6 @@ class MazeNavigator(Node):
         self.color_check_count = 0
         self.color_check_samples = []
         self.loop_count = 0
-        self.centering_count = 0
 
         self.get_logger().info('[NAV] Maze Navigator Híbrido: Centralização OMNI + Memória')
 
@@ -228,7 +219,7 @@ class MazeNavigator(Node):
 
         if not corrections:
             return None
-            
+
         return sum(corrections) / len(corrections)
 
     def _heading_correction(self) -> float:
@@ -236,7 +227,7 @@ class MazeNavigator(Node):
         wall_error = self._get_wall_alignment_error()
         if wall_error is None:
             return 0.0
-            
+
         az = self.ALIGN_KP * wall_error
         return max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
 
@@ -249,7 +240,6 @@ class MazeNavigator(Node):
 
         if self.state == 'COLOR_CHECK': self._state_color_check(twist)
         elif self.state == 'TURNING': self._state_turning(twist)
-        elif self.state == 'CENTERING': self._state_centering(twist)
         else: self._state_follow_corridor(twist)
 
         self.cmd_pub.publish(twist)
@@ -261,12 +251,6 @@ class MazeNavigator(Node):
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
-
-        # Registra cor vista enquanto passa por passagem lateral aberta
-        if self.detected_color is not None and (self.left_dist > 0.8 or self.right_dist > 0.8):
-            if self.last_seen_color != self.detected_color:
-                self.get_logger().info(f'[NAV] Cor lateral detectada: {self.detected_color}')
-            self.last_seen_color = self.detected_color
 
         self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * self._lateral_correction()
         twist.linear.x, twist.linear.y, twist.angular.z = self.FORWARD_SPEED, self.lat_cmd, self._heading_correction()
@@ -282,57 +266,31 @@ class MazeNavigator(Node):
         self.color_check_count += 1
 
         if self.color_check_count >= self.COLOR_CHECK_CYCLES:
-            colored = [c for c in self.color_check_samples if c is not None]
-            lateral = self.last_seen_color
-            color_decision = Counter(colored).most_common(1)[0][0] if colored else lateral
-            self.last_seen_color = None
+            counts = Counter(self.color_check_samples)
+            color_decision = counts.most_common(1)[0][0]
             self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
             self.state = 'TURNING'
-            self.get_logger().info(f'[NAV] Decisão: {desc} | frente={len(colored)} amostras, lateral={lateral}')
+            self.get_logger().info(f'[NAV] Decisão: {desc}')
 
     def _state_turning(self, twist: Twist):
-        """Gira com controle proporcional até atingir target_yaw, depois centraliza."""
+        """Gira pela odometria até atingir target_yaw."""
         odom_error = normalize_angle(self.target_yaw - self.current_yaw)
 
         if abs(odom_error) < self.YAW_TOLERANCE:
-            self.state = 'CENTERING'
-            self.centering_count = 0
-            self.lat_cmd = 0.0
-            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            self.get_logger().info(
-                f'[NAV] Giro finalizado ({math.degrees(odom_error):.1f}°). Centralizando...')
-        else:
-            # Proporcional: desacelera suavemente ao aproximar do alvo
-            raw = self.TURN_KP * odom_error
-            speed = max(self.TURN_MIN_SPEED, min(abs(raw), self.TURN_MAX_SPEED))
-            twist.linear.x = twist.linear.y = 0.0
-            twist.angular.z = math.copysign(speed, raw)
-
-    def _state_centering(self, twist: Twist):
-        """Após curva: ajusta lateral e heading para ficar equidistante das paredes."""
-        lat_raw = self._lateral_correction()
-        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * lat_raw
-        hdg = self._heading_correction()
-
-        self.centering_count += 1
-        centered  = abs(lat_raw) < self.CENTER_LAT_TOL and abs(hdg) < self.CENTER_HDG_TOL
-        timed_out = self.centering_count >= self.MAX_CENTER_CYCLES
-
-        if centered or timed_out:
-            reason = 'centralizado' if centered else 'timeout'
             self.state = 'FOLLOW_CORRIDOR'
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            self.get_logger().info(f'[NAV] Centralização concluída ({reason})')
-            return
-
-        # Fica parado longitudinalmente; corrige lateral e heading
-        twist.linear.x = 0.0
-        twist.linear.y = self.lat_cmd
-        twist.angular.z = hdg
+            self.get_logger().info(
+                f'[NAV] Giro finalizado. Erro: {math.degrees(odom_error):.1f}°')
+        else:
+            twist.linear.x = twist.linear.y = 0.0
+            twist.angular.z = self.TURN_SPEED * self.turn_direction
 
     def destroy_node(self):
-        self.cmd_pub.publish(Twist())
+        try:
+            self.cmd_pub.publish(Twist())
+        except Exception:
+            pass
         super().destroy_node()
 
 def main(args=None):
