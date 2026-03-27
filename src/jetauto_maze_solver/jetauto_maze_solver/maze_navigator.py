@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Maze Navigator — Centro do Corredor (Robô Omnidirecional)
+Maze Navigator — Regra da Mao Direita (Robo Omnidirecional)
 
-O robô usa o LiDAR para medir as distâncias às paredes esquerda e direita
-e emprega linear.y para se manter centrado no corredor enquanto avança.
-Quando a frente está bloqueada, a câmera determina a direção do giro:
-  Vermelho → esquerda  |  Verde → direita  |  Sem cor → lado com mais espaço
+Resolve o labirinto usando a regra da mao direita (right-hand rule):
+  1. Se o corredor abre a direita -> vira a direita
+  2. Se a frente esta livre -> segue em frente
+  3. Se a frente esta bloqueada -> vira a esquerda (ou 180 se beco sem saida)
+
+Cores da camera podem sobrescrever a decisao quando a frente esta bloqueada:
+  Vermelho / Azul -> esquerda  |  Verde -> direita
 
 Estados:
-  FOLLOW_CORRIDOR → avança, centraliza lateralmente, corrige heading
-  TURNING         → giro no lugar controlado por odometria
+  FOLLOW_CORRIDOR -> avanca, centraliza lateralmente, corrige heading
+  TURNING         -> giro no lugar controlado por odometria
+  ADVANCE         -> avanca brevemente apos curva para entrar no novo corredor
 
-Tópicos:
+Topicos:
   Assina: /jetauto/lidar/scan, /odometry/filtered, /jetauto/camera/image_raw
   Publica: /jetauto/cmd_vel
 """
@@ -27,9 +31,9 @@ from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Utilitários de ângulo
-# ═══════════════════════════════════════════════════════════════════════
+# =====================================================================
+# Utilitarios de angulo
+# =====================================================================
 
 def yaw_from_quaternion(q):
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -45,13 +49,13 @@ def normalize_angle(angle):
     return angle
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Nó principal
-# ═══════════════════════════════════════════════════════════════════════
+# =====================================================================
+# No principal
+# =====================================================================
 
 class MazeNavigator(Node):
 
-    # ── Setores do LiDAR (radianos) ────────────────────────────────
+    # -- Setores do LiDAR (radianos) --
     FRONT_LO = math.radians(-20)
     FRONT_HI = math.radians(20)
     LEFT_LO  = math.radians(70)
@@ -59,84 +63,95 @@ class MazeNavigator(Node):
     RIGHT_LO = math.radians(-110)
     RIGHT_HI = math.radians(-70)
 
-    # Raios individuais para cálculo de heading (dois por parede)
-    R_SIDE_ANGLE = math.radians(-90)   # perpendicular à parede direita
-    R_DIAG_ANGLE = math.radians(-45)   # diagonal frente-direita
-    L_SIDE_ANGLE = math.radians(90)    # perpendicular à parede esquerda
-    L_DIAG_ANGLE = math.radians(45)    # diagonal frente-esquerda
+    # Raios individuais para calculo de heading (dois por parede)
+    R_SIDE_ANGLE = math.radians(-90)
+    R_DIAG_ANGLE = math.radians(-45)
+    L_SIDE_ANGLE = math.radians(90)
+    L_DIAG_ANGLE = math.radians(45)
 
-    # ── Limiares de distância (metros) ─────────────────────────────
-    FRONT_BLOCKED = 0.5     # frente bloqueada → escolhe direção e gira
-    WALL_DETECT   = 1.2     # distância máxima para considerar parede presente
-    TARGET_SIDE   = 0.4     # distância desejada à parede (um só lado)
+    # -- Limiares de distancia (metros) --
+    FRONT_BLOCKED  = 0.5
+    WALL_DETECT    = 1.2
+    SIDE_OPEN      = 1.0    # distancia acima da qual o lado esta "aberto"
+    TARGET_SIDE    = 0.4
 
-    # ── Controle lateral — linear.y ─────────────────────────────────
-    # Positivo = mover para a esquerda (convenção ROS, y aponta para esquerda)
-    KP_LAT    = 0.3     # ganho proporcional
-    LAT_CLAMP = 0.15    # velocidade lateral máxima (m/s)
+    # -- Controle lateral -- linear.y --
+    KP_LAT    = 0.3
+    LAT_CLAMP = 0.15
 
-    # ── Correção de heading — angular.z ─────────────────────────────
+    # -- Correcao de heading -- angular.z --
     ALIGN_KP    = 1.5
-    ALIGN_CLAMP = 0.1   # rad/s máximo de correção
+    ALIGN_CLAMP = 0.1
 
-    # ── Velocidades ─────────────────────────────────────────────────
-    FORWARD_SPEED = 0.15    # m/s para frente
-    TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
-    YAW_TOLERANCE = 0.05    # rad (~2.9°)
+    # -- Velocidades --
+    FORWARD_SPEED = 0.15
+    TURN_SPEED    = 0.4
+    YAW_TOLERANCE = 0.05    # rad (~2.9 graus)
 
-    # ── LiDAR ───────────────────────────────────────────────────────
+    # -- LiDAR --
     RANGE_CAP       = 3.0
     LIDAR_MIN_VALID = 0.15
 
-    # ── Câmera — faixas HSV ─────────────────────────────────────────
-    COLOR_MIN_AREA_FRAC = 0.05  # área mínima relativa da cor na imagem
-    RED_LOWER1  = np.array([0,   80,  50])
-    RED_UPPER1  = np.array([10,  255, 255])
-    RED_LOWER2  = np.array([170, 80,  50])
-    RED_UPPER2  = np.array([180, 255, 255])
-    GREEN_LOWER = np.array([40,  80,  50])
-    GREEN_UPPER = np.array([85,  255, 255])
+    # -- Temporizacoes --
+    ADVANCE_SECS       = 1.5   # segundos avancando apos curva
+    TURN_COOLDOWN_SECS = 2.0   # cooldown antes de checar parede aberta de novo
+
+    # -- Camera -- faixas HSV --
+    COLOR_MIN_AREA_FRAC = 0.05
+    RED_LOWER1   = np.array([0,   80,  50])
+    RED_UPPER1   = np.array([10,  255, 255])
+    RED_LOWER2   = np.array([170, 80,  50])
+    RED_UPPER2   = np.array([180, 255, 255])
+    GREEN_LOWER  = np.array([40,  80,  50])
+    GREEN_UPPER  = np.array([85,  255, 255])
+    BLUE_LOWER   = np.array([100, 80,  50])
+    BLUE_UPPER   = np.array([130, 255, 255])
 
     def __init__(self):
         super().__init__('maze_navigator')
 
         self.create_subscription(LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
-        self.create_subscription(Image, '/jetauto/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, '/jetauto/cmd_vel', 10)
         self.bridge = CvBridge()
         self.timer = self.create_timer(0.1, self._control_loop)
 
-        # ── LiDAR ──
+        # -- LiDAR --
         self.front_dist = self.RANGE_CAP
         self.left_dist  = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
-        self.r_side = self.RANGE_CAP  # raio a -90°
-        self.r_diag = self.RANGE_CAP  # raio a -45°
-        self.l_side = self.RANGE_CAP  # raio a +90°
-        self.l_diag = self.RANGE_CAP  # raio a +45°
+        self.r_side = self.RANGE_CAP
+        self.r_diag = self.RANGE_CAP
+        self.l_side = self.RANGE_CAP
+        self.l_diag = self.RANGE_CAP
         self.scan_ready = False
 
-        # ── Odometria ──
+        # -- Odometria --
         self.current_yaw = 0.0
         self.odom_ready = False
 
-        # ── Câmera ──
-        self.detected_color = None   # 'vermelho', 'verde' ou None
+        # -- Camera --
+        self.detected_color = None   # 'vermelho', 'verde', 'azul' ou None
 
-        # ── Máquina de estados ──
+        # -- Maquina de estados --
         self.state = 'FOLLOW_CORRIDOR'
-        self.target_yaw     = 0.0
-        self.turn_direction = 0.0   # +1 = esquerda, -1 = direita
-        self.loop_count = 0
+        self.target_yaw      = 0.0
+        self.turn_direction   = 0.0
+        self.loop_count       = 0
+
+        # -- Regra da mao direita --
+        self._had_right_wall      = False
+        self._turn_cooldown_end   = 0.0
+        self._advance_start       = 0.0
 
         self.get_logger().info(
-            '[NAV] Maze Navigator iniciado — Centro do Corredor + Paredes Coloridas')
+            '[NAV] Maze Navigator iniciado — Regra da Mao Direita')
 
-    # ══════════════════════════════════════════════════════════════════
+    # =================================================================
     # Callbacks dos sensores
-    # ══════════════════════════════════════════════════════════════════
+    # =================================================================
 
     def _odom_cb(self, msg: Odometry):
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
@@ -178,7 +193,7 @@ class MazeNavigator(Node):
         self.scan_ready = True
 
     def _image_cb(self, msg: Image):
-        """Detecta cor dominante (vermelho/verde) no frame atual da câmera."""
+        """Detecta cor dominante (vermelho/verde/azul) no frame atual."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
@@ -195,68 +210,85 @@ class MazeNavigator(Node):
         red_area   = cv2.countNonZero(mask_r)
         green_area = cv2.countNonZero(
             cv2.inRange(hsv, self.GREEN_LOWER, self.GREEN_UPPER))
+        blue_area  = cv2.countNonZero(
+            cv2.inRange(hsv, self.BLUE_LOWER, self.BLUE_UPPER))
 
-        if red_area >= min_area and red_area >= green_area:
+        best_area = max(red_area, green_area, blue_area)
+        if best_area < min_area:
+            self.detected_color = None
+        elif best_area == red_area:
             self.detected_color = 'vermelho'
-        elif green_area >= min_area and green_area > red_area:
+        elif best_area == green_area:
             self.detected_color = 'verde'
         else:
-            self.detected_color = None
+            self.detected_color = 'azul'
 
-    # ══════════════════════════════════════════════════════════════════
-    # Cálculos de controle
-    # ══════════════════════════════════════════════════════════════════
+    # =================================================================
+    # Calculos de controle
+    # =================================================================
 
-    def _choose_turn(self):
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _start_turn(self, target_yaw, direction, desc):
+        """Inicia um giro para target_yaw."""
+        self.target_yaw = target_yaw
+        self.turn_direction = direction
+        self.state = 'TURNING'
+        self.get_logger().info(
+            f'[NAV] -> TURNING {desc}  '
+            f'F={self.front_dist:.2f} Lray={self.l_side:.2f} Rray={self.r_side:.2f}  '
+            f'target={math.degrees(target_yaw):.1f} graus')
+
+    def _choose_turn_front_blocked(self):
         """
-        Decide a direção do giro quando a frente está bloqueada.
+        Decide a direcao do giro quando a frente esta bloqueada.
 
         Prioridade:
-          1. Câmera detectou VERMELHO → esquerda
-          2. Câmera detectou VERDE    → direita
-          3. Sem cor: vira para o lado com maior espaço lateral
+          1. Camera detectou VERMELHO ou AZUL -> esquerda
+          2. Camera detectou VERDE            -> direita
+          3. Sem cor -> regra da mao direita:
+             direita livre -> direita
+             esquerda livre -> esquerda
+             tudo bloqueado -> meia-volta (180 graus)
         """
         color = self.detected_color
-        if color == 'vermelho':
+
+        if color == 'vermelho' or color == 'azul':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
-            return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif color == 'verde':
+            return target, 1.0, f'esquerda (parede {color.upper()})'
+
+        if color == 'verde':
             target = normalize_angle(self.current_yaw - math.pi / 2.0)
             return target, -1.0, 'direita (parede VERDE)'
-        else:
-            # Sem indicação de cor: prefere o lado com mais espaço
-            if self.left_dist >= self.right_dist:
-                target = normalize_angle(self.current_yaw + math.pi / 2.0)
-                return target, 1.0, 'esquerda (mais espaço)'
-            else:
-                target = normalize_angle(self.current_yaw - math.pi / 2.0)
-                return target, -1.0, 'direita (mais espaço)'
+
+        # Sem cor: regra da mao direita
+        # Usa raios perpendiculares (90/-90 graus) para detectar aberturas
+        # Threshold = WALL_DETECT (1.2m) — paredes do corredor ficam a ~0.75m
+        if self.r_side > self.WALL_DETECT:
+            target = normalize_angle(self.current_yaw - math.pi / 2.0)
+            return target, -1.0, 'direita (mao direita)'
+
+        if self.l_side > self.WALL_DETECT:
+            target = normalize_angle(self.current_yaw + math.pi / 2.0)
+            return target, 1.0, 'esquerda (unica saida)'
+
+        # Beco sem saida -> meia-volta
+        target = normalize_angle(self.current_yaw + math.pi)
+        return target, 1.0, 'MEIA-VOLTA (beco sem saida)'
 
     def _lateral_correction(self) -> float:
-        """
-        Calcula linear.y para centralizar o robô no corredor.
-
-        Convenção ROS: linear.y > 0 → move para esquerda.
-
-        Casos:
-          Ambas as paredes: centraliza entre elas.
-          Só parede direita: mantém TARGET_SIDE de distância.
-          Só parede esquerda: mantém TARGET_SIDE de distância.
-          Nenhuma parede: sem correção lateral.
-        """
+        """Calcula linear.y para centralizar o robo no corredor."""
         L = self.left_dist
         R = self.right_dist
         left_wall  = L < self.WALL_DETECT
         right_wall = R < self.WALL_DETECT
 
         if left_wall and right_wall:
-            # (L - R) / 2 > 0 → mais próximo da direita → mover esquerda ✓
             error = (L - R) / 2.0
         elif right_wall:
-            # TARGET_SIDE - R > 0 quando muito perto da direita → mover esquerda ✓
             error = self.TARGET_SIDE - R
         elif left_wall:
-            # L - TARGET_SIDE < 0 quando muito perto da esquerda → mover direita ✓
             error = L - self.TARGET_SIDE
         else:
             error = 0.0
@@ -264,21 +296,7 @@ class MazeNavigator(Node):
         return max(-self.LAT_CLAMP, min(self.KP_LAT * error, self.LAT_CLAMP))
 
     def _heading_correction(self) -> float:
-        """
-        Calcula angular.z para manter o robô alinhado com o corredor.
-
-        Usa geometria de dois raios por parede para derivar o ângulo real
-        do robô em relação à superfície. Combina as correções de ambas
-        as paredes presentes (média).
-
-        Geometria (frame do robô: x=frente, y=esquerda):
-          Parede direita — raios a -90° (a) e -45° (b):
-            Vetor da parede: dx = b·cos45, dy = a − b·sin45
-            Erro de heading = atan2(dy, dx)
-          Parede esquerda — raios a +90° (c) e +45° (d):
-            Vetor da parede: dx = d·cos45, dy = d·sin45 − c
-            Erro de heading = atan2(dy, dx)   ← mesmo sinal, geometria simétrica
-        """
+        """Calcula angular.z para manter o robo alinhado com o corredor."""
         corrections = []
 
         a, b = self.r_side, self.r_diag
@@ -300,9 +318,9 @@ class MazeNavigator(Node):
         az = self.ALIGN_KP * heading_error
         return max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
 
-    # ══════════════════════════════════════════════════════════════════
+    # =================================================================
     # Loop de controle principal (10 Hz)
-    # ══════════════════════════════════════════════════════════════════
+    # =================================================================
 
     def _control_loop(self):
         if not self.scan_ready or not self.odom_ready:
@@ -313,61 +331,77 @@ class MazeNavigator(Node):
 
         if self.state == 'TURNING':
             self._state_turning(twist)
+        elif self.state == 'ADVANCE':
+            self._state_advance(twist)
         else:
             self._state_follow_corridor(twist)
 
         self.cmd_pub.publish(twist)
 
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # ESTADO: FOLLOW_CORRIDOR
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     def _state_follow_corridor(self, twist: Twist):
         """
-        Avança reto enquanto:
-          1. linear.y centraliza lateralmente no corredor
-          2. angular.z mantém o heading paralelo às paredes
+        Avanca reto, centralizando e corrigindo heading.
 
-        Transição: frente bloqueada → consulta câmera → TURNING
+        Transicoes (regra da mao direita):
+          1. Frente bloqueada -> decide via cor ou mao-direita
+          2. Parede direita sumiu -> vira a direita (proativo)
         """
+        now = self._now_sec()
+
+        # -- Prioridade 1: frente bloqueada (seguranca) --
         if self.front_dist <= self.FRONT_BLOCKED:
-            self.target_yaw, self.turn_direction, desc = self._choose_turn()
-            self.state = 'TURNING'
-            self.get_logger().info(
-                f'[NAV] FOLLOW_CORRIDOR → TURNING {desc}  '
-                f'F={self.front_dist:.2f}m  '
-                f'target={math.degrees(self.target_yaw):.1f}°')
-            twist.linear.x  = 0.0
-            twist.linear.y  = 0.0
+            target, direction, desc = self._choose_turn_front_blocked()
+            self._start_turn(target, direction, desc)
+            twist.linear.x = 0.0
+            twist.linear.y = 0.0
             twist.angular.z = 0.0
             return
 
+        # -- Prioridade 2: regra da mao direita -- corredor abriu a direita --
+        # Usa raio perpendicular (-90 graus) para detectar abertura
+        right_open = self.r_side > self.SIDE_OPEN
+        if right_open and self._had_right_wall and now > self._turn_cooldown_end:
+            target = normalize_angle(self.current_yaw - math.pi / 2.0)
+            self._start_turn(target, -1.0, 'direita (corredor abriu)')
+            twist.linear.x = 0.0
+            twist.linear.y = 0.0
+            twist.angular.z = 0.0
+            return
+
+        # -- Atualiza rastreamento da parede direita --
+        if self.r_side < self.WALL_DETECT:
+            self._had_right_wall = True
+
+        # -- Movimento normal --
         twist.linear.x  = self.FORWARD_SPEED
         twist.linear.y  = self._lateral_correction()
         twist.angular.z = self._heading_correction()
 
         if self.loop_count % 20 == 0:
             self.get_logger().info(
-                f'[NAV] FOLLOW_CORRIDOR  '
-                f'F={self.front_dist:.2f}m  '
-                f'L={self.left_dist:.2f}m  R={self.right_dist:.2f}m  '
-                f'vy={twist.linear.y:+.3f}  az={twist.angular.z:+.3f}  '
-                f'cor={self.detected_color}')
+                f'[NAV] FOLLOW  '
+                f'F={self.front_dist:.2f} Lray={self.l_side:.2f} Rray={self.r_side:.2f}  '
+                f'vy={twist.linear.y:+.3f} az={twist.angular.z:+.3f}  '
+                f'rwall={self._had_right_wall} cor={self.detected_color}')
 
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
     # ESTADO: TURNING
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     def _state_turning(self, twist: Twist):
-        """Gira no lugar até atingir target_yaw com tolerância YAW_TOLERANCE."""
+        """Gira no lugar ate atingir target_yaw."""
         error = normalize_angle(self.target_yaw - self.current_yaw)
 
         if abs(error) < self.YAW_TOLERANCE:
-            self.state = 'FOLLOW_CORRIDOR'
+            self.state = 'ADVANCE'
+            self._advance_start = self._now_sec()
             self.get_logger().info(
-                f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
-                f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                f'erro_final={math.degrees(error):.1f}°')
+                f'[NAV] TURNING concluido -> ADVANCE  '
+                f'yaw={math.degrees(self.current_yaw):.1f} graus')
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
             twist.angular.z = 0.0
@@ -377,23 +411,52 @@ class MazeNavigator(Node):
             twist.angular.z = self.TURN_SPEED * self.turn_direction
             if self.loop_count % 5 == 0:
                 self.get_logger().info(
-                    f'[NAV] TURNING  erro={math.degrees(error):.1f}°  '
-                    f'az={twist.angular.z:+.2f}  '
-                    f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                    f'target={math.degrees(self.target_yaw):.1f}°')
+                    f'[NAV] TURNING  erro={math.degrees(error):.1f} graus  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}  '
+                    f'target={math.degrees(self.target_yaw):.1f}')
 
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
+    # ESTADO: ADVANCE
+    # -----------------------------------------------------------------
+
+    def _state_advance(self, twist: Twist):
+        """
+        Avanca brevemente apos uma curva para entrar no novo corredor.
+        Usa correcao lateral e de heading para nao bater nas paredes.
+        """
+        elapsed = self._now_sec() - self._advance_start
+
+        if elapsed >= self.ADVANCE_SECS or self.front_dist <= 0.3:
+            self.state = 'FOLLOW_CORRIDOR'
+            self._had_right_wall = self.r_side < self.WALL_DETECT
+            self._turn_cooldown_end = self._now_sec() + self.TURN_COOLDOWN_SECS
+            self.get_logger().info(
+                f'[NAV] ADVANCE concluido -> FOLLOW_CORRIDOR  '
+                f'rwall={self._had_right_wall}')
+            twist.linear.x  = 0.0
+            twist.linear.y  = 0.0
+            twist.angular.z = 0.0
+            return
+
+        twist.linear.x  = self.FORWARD_SPEED
+        twist.linear.y  = self._lateral_correction()
+        twist.angular.z = self._heading_correction()
+
+    # -----------------------------------------------------------------
     # Cleanup
-    # ──────────────────────────────────────────────────────────────────
+    # -----------------------------------------------------------------
 
     def destroy_node(self):
-        self.cmd_pub.publish(Twist())
+        try:
+            self.cmd_pub.publish(Twist())
+        except Exception:
+            pass
         super().destroy_node()
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =====================================================================
 # Ponto de entrada
-# ═══════════════════════════════════════════════════════════════════════
+# =====================================================================
 
 def main(args=None):
     rclpy.init(args=args)
@@ -404,7 +467,10 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
