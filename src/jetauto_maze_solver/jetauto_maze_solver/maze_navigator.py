@@ -308,6 +308,16 @@ class MazeNavigator(Node):
         else:
             yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
             yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
+
+            left_open  = self.left_max  > self.WALL_DETECT
+            right_open = self.right_max > self.WALL_DETECT
+
+            if left_open and not right_open:
+                return yaw_L, 1.0, f'esquerda (LiDAR: L aberto={self.left_max:.2f}m, R parede={self.right_max:.2f}m)'
+            elif right_open and not left_open:
+                return yaw_R, -1.0, f'direita (LiDAR: R aberto={self.right_max:.2f}m, L parede={self.left_max:.2f}m)'
+
+            # Ambos abertos ou ambos fechados → usa anti-backtracking
             score_L = self._visited_score(yaw_L)
             score_R = self._visited_score(yaw_R)
             if score_L <= score_R:
