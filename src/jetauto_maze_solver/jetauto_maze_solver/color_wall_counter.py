@@ -3,11 +3,11 @@
 Sistema de Visao — Deteccao e Contagem de Paredes Coloridas (Isolado e Passivo)
 
 Detecta paredes Azuis, Verdes e Vermelhas usando camera RGB.
-Usa posicao e orientacao do robo (odometria) para evitar contar a mesma parede duas vezes:
-  - Cooldown temporal de 5s por cor (mesma parede enquanto passa)
-  - Deduplicacao espacial: so conta se estiver >3m de deteccoes anteriores da mesma cor
-  - Deduplicacao de verso: bloqueia se estiver <4m e ~180° virado em relacao a deteccao anterior
-    (frente e verso da mesma parede contados como uma so)
+Usa posicao e orientacao do robo (odometria) para estimar a posicao real da parede no mundo:
+  - Cooldown temporal de 5s por cor (evita re-deteccao imediata)
+  - Deduplicacao por posicao estimada da parede: dist_aprox = MIN_DET_DIST * sqrt(MIN_AREA / area)
+    projetada na direcao do yaw do robo — frente e verso da mesma parede produzem
+    estimativas proximas e sao automaticamente bloqueadas pelo WALL_CLUSTER_DIST
 
 *** Este no NUNCA publica comandos de velocidade. ***
 
@@ -30,9 +30,10 @@ class ColorWallCounter(Node):
 
     MIN_AREA_FRACTION = 0.06
     COOLDOWN_SECS = 5.0
-    MIN_DISTANCE = 3.0   # metros — distancia minima entre deteccoes da mesma cor
-    BACK_WALL_DISTANCE = 4.0   # metros — raio para detectar verso da mesma parede
-    BACK_WALL_ANGLE = 2.5      # radianos (~143°) — angulo minimo para considerar verso
+    # Distancia estimada (m) ate a parede quando area_fraction == MIN_AREA_FRACTION
+    MIN_DET_DIST = 2.0
+    # Distancia maxima (m) entre estimativas de posicao para ser considerada a mesma parede
+    WALL_CLUSTER_DIST = 1.0
 
     COLOR_RANGES = {
         'azul': [
@@ -69,7 +70,7 @@ class ColorWallCounter(Node):
         # Cooldown temporal por cor
         self.last_detection_time = {color: None for color in self.COLOR_RANGES}
 
-        # Posicoes (x, y) onde cada cor foi detectada — para deduplicacao espacial
+        # Posicoes estimadas (wall_x, wall_y) de cada parede detectada
         self.detection_positions = {color: [] for color in self.COLOR_RANGES}
 
         # Posicao atual do robo
@@ -83,7 +84,8 @@ class ColorWallCounter(Node):
         self.get_logger().info(
             f'[VISAO] Cooldown: {self.COOLDOWN_SECS}s  '
             f'Area minima: {self.MIN_AREA_FRACTION * 100:.0f}%  '
-            f'Dist minima: {self.MIN_DISTANCE}m')
+            f'Dist deteccao: {self.MIN_DET_DIST}m  '
+            f'Cluster parede: {self.WALL_CLUSTER_DIST}m')
 
     def _odom_cb(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
@@ -126,24 +128,33 @@ class ColorWallCounter(Node):
             if area < min_area:
                 continue
 
+            # Estimar posicao da parede no mundo:
+            #   quanto maior a area aparente, mais perto a parede esta.
+            #   dist_aprox = MIN_DET_DIST * sqrt(MIN_AREA_FRACTION / area_fraction)
+            area_fraction = area / (h * w)
+            approx_dist = self.MIN_DET_DIST * math.sqrt(
+                self.MIN_AREA_FRACTION / area_fraction)
+            wall_x = self.robot_x + approx_dist * math.cos(self.robot_yaw)
+            wall_y = self.robot_y + approx_dist * math.sin(self.robot_yaw)
+
             # Cooldown temporal
             if not self._cooldown_ok(color, now):
                 continue
 
-            # Deduplicacao espacial — so conta se longe de deteccoes anteriores
-            if not self._position_ok(color):
+            # Deduplicacao pela posicao estimada da parede
+            if not self._position_ok(color, wall_x, wall_y):
                 continue
 
             # Nova parede detectada!
             self.counts[color] += 1
             self.last_detection_time[color] = now
-            self.detection_positions[color].append(
-                (self.robot_x, self.robot_y, self.robot_yaw))
+            self.detection_positions[color].append((wall_x, wall_y))
 
             placar = self._format_placar()
             self.get_logger().info(
-                f'[VISAO] Parede {color.upper()} detectada em '
-                f'({self.robot_x:.1f}, {self.robot_y:.1f})! '
+                f'[VISAO] Parede {color.upper()} — '
+                f'robo=({self.robot_x:.1f},{self.robot_y:.1f}) '
+                f'parede≈({wall_x:.1f},{wall_y:.1f}) dist≈{approx_dist:.1f}m | '
                 f'Placar: {placar}')
 
     def _cooldown_ok(self, color: str, now) -> bool:
@@ -153,24 +164,18 @@ class ColorWallCounter(Node):
         elapsed = (now - last).nanoseconds / 1e9
         return elapsed >= self.COOLDOWN_SECS
 
-    def _position_ok(self, color: str) -> bool:
-        """Retorna True se a posicao atual nao e duplicata de deteccoes anteriores.
+    def _position_ok(self, color: str, wall_x: float, wall_y: float) -> bool:
+        """Retorna True se a parede estimada e diferente de todas as anteriores.
 
-        Bloqueia se:
-          - distancia < MIN_DISTANCE (mesma face da parede), OU
-          - distancia < BACK_WALL_DISTANCE E angulo ~180° (verso da mesma parede).
+        Compara posicoes estimadas das paredes — nao do robo.
+        Frente e verso da mesma parede produzem estimativas proximas,
+        portanto sao bloqueadas pelo WALL_CLUSTER_DIST independentemente
+        da direcao de aproximacao.
         """
-        for px, py, pyaw in self.detection_positions[color]:
-            dist = math.sqrt((self.robot_x - px) ** 2 + (self.robot_y - py) ** 2)
-            if dist < self.MIN_DISTANCE:
+        for wx, wy in self.detection_positions[color]:
+            dist = math.sqrt((wall_x - wx) ** 2 + (wall_y - wy) ** 2)
+            if dist < self.WALL_CLUSTER_DIST:
                 return False
-            if dist < self.BACK_WALL_DISTANCE:
-                angle_diff = abs(math.atan2(
-                    math.sin(self.robot_yaw - pyaw),
-                    math.cos(self.robot_yaw - pyaw)
-                ))
-                if angle_diff > self.BACK_WALL_ANGLE:
-                    return False
         return True
 
     def _format_placar(self) -> str:
@@ -194,8 +199,8 @@ class ColorWallCounter(Node):
         ]
         for color in self.COLOR_RANGES:
             lines.append(f'  {color.capitalize():10s}: {self.counts[color]}')
-            for i, (px, py, pyaw) in enumerate(self.detection_positions[color], 1):
-                lines.append(f'    #{i} em ({px:.1f}, {py:.1f}) yaw={math.degrees(pyaw):.0f}°')
+            for i, (wx, wy) in enumerate(self.detection_positions[color], 1):
+                lines.append(f'    #{i} parede estimada em ({wx:.1f}, {wy:.1f})')
         lines += [
             '',
             f'Total de paredes detectadas: {total}',
