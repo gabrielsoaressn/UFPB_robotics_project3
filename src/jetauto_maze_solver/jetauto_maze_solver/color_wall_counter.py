@@ -56,7 +56,7 @@ class ColorWallCounter(Node):
         self.bridge = CvBridge()
 
         self.create_subscription(
-            Image, '/jetauto/camera/image_raw', self._image_cb, 10)
+            Image, '/camera/image_raw', self._image_cb, 10)
         self.create_subscription(
             Odometry, '/odometry/filtered', self._odom_cb, 10)
 
