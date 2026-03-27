@@ -34,10 +34,14 @@ class ColorWallCounter(Node):
     # Tolerancia horizontal: centroide da cor deve estar no centro +/- (CENTER_TOL * largura)
     # 0.25 = aceita somente no quarto central da imagem (parede na frente do robo)
     CENTER_TOL = 0.25
+    # Velocidade linear maxima (m/s) para considerar que o robo esta parado
+    MAX_SPEED = 0.05
+    # Velocidade angular maxima (rad/s) — exclui curvas/rotacoes
+    MAX_ANGULAR_SPEED = 0.1
     # Distancia estimada (m) ate a parede quando area_fraction == MIN_AREA_FRACTION
     MIN_DET_DIST = 1.5
     # Distancia maxima (m) entre estimativas de posicao para ser considerada a mesma parede
-    WALL_CLUSTER_DIST = 1.2
+    WALL_CLUSTER_DIST = 2.5
 
     COLOR_RANGES = {
         'azul': [
@@ -77,19 +81,21 @@ class ColorWallCounter(Node):
         # Posicoes estimadas (wall_x, wall_y) de cada parede detectada
         self.detection_positions = {color: [] for color in self.COLOR_RANGES}
 
-        # Posicao atual do robo
+        # Posicao e velocidade atual do robo
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
+        self.robot_speed = 0.0
+        self.robot_angular_speed = 0.0
         self.odom_ready = False
 
         self.get_logger().info(
             '[VISAO] Sistema de Visao iniciado — detectando paredes coloridas')
         self.get_logger().info(
             f'[VISAO] Cooldown: {self.COOLDOWN_SECS}s  '
+            f'Vel max: {self.MAX_SPEED}m/s  '
             f'Area minima: {self.MIN_AREA_FRACTION * 100:.0f}%  '
             f'Centro +/-{self.CENTER_TOL * 100:.0f}%  '
-            f'Dist deteccao: {self.MIN_DET_DIST}m  '
             f'Cluster parede: {self.WALL_CLUSTER_DIST}m')
 
     def _odom_cb(self, msg: Odometry):
@@ -100,10 +106,18 @@ class ColorWallCounter(Node):
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         )
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        self.robot_speed = math.sqrt(vx * vx + vy * vy)
+        self.robot_angular_speed = abs(msg.twist.twist.angular.z)
         self.odom_ready = True
 
     def _image_cb(self, msg: Image):
         if not self.odom_ready:
+            return
+
+        # So processa imagem quando o robo esta completamente parado
+        if self.robot_speed > self.MAX_SPEED or self.robot_angular_speed > self.MAX_ANGULAR_SPEED:
             return
 
         try:
