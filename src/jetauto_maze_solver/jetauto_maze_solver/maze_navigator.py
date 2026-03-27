@@ -163,7 +163,8 @@ class MazeNavigator(Node):
         self.turn_direction  = 0.0   # +1 = esquerda, -1 = direita
         self.color_check_count   = 0
         self.color_check_samples = []
-        self.consecutive_blocks  = 0   # giros seguidos com frente ainda bloqueada
+        self.consecutive_blocks  = 0   # giros seguidos sem cor com frente bloqueada
+        self.total_blocks        = 0   # todos os giros com frente bloqueada (inclui coloridos)
         self.loop_count = 0
 
         self.get_logger().info(
@@ -283,7 +284,27 @@ class MazeNavigator(Node):
           3. Sem cor  → direção com menor score de células visitadas.
                         Empate: esquerda.
         """
-        # ── Beco sem saída ──
+        # ── Beco sem saída com cor (loop detector) ──
+        # Se o robô fez muitos giros consecutivos (mesmo coloridos) sem sair,
+        # está preso num beco com parede colorida → força U-turn de emergência.
+        self.total_blocks += 1
+        if self.total_blocks >= 4:
+            self.total_blocks = 0
+            self.consecutive_blocks = 0
+            target = normalize_angle(self.current_yaw + math.pi)
+            self.get_logger().warn('[NAV] Beco detectado (loop com cor) → U-turn emergência')
+            return target, 1.0, 'U-turn 180° (loop com cor)'
+
+        # ── Cor da câmera (prioridade sobre deadend sem cor) ──
+        # Não incrementa consecutive_blocks para não confundir giro correto com beco.
+        if color_decision == 'vermelho':
+            target = normalize_angle(self.current_yaw + math.pi / 2.0)
+            return target, 1.0, 'esquerda (parede VERMELHA)'
+        elif color_decision == 'verde':
+            target = normalize_angle(self.current_yaw - math.pi / 2.0)
+            return target, -1.0, 'direita (parede VERDE)'
+
+        # ── Beco sem saída (sem cor) ──
         geo_deadend   = (self.left_max  <= self.SIDE_BLOCKED
                          and self.right_max <= self.SIDE_BLOCKED)
         self.consecutive_blocks += 1
@@ -296,34 +317,25 @@ class MazeNavigator(Node):
             self.get_logger().warn(f'[NAV] Beco detectado ({reason}) → U-turn')
             return target, 1.0, f'U-turn 180° ({reason})'
 
-        # ── Cor da câmera ──
-        effective_color = color_decision
+        # ── Sem cor: LiDAR + anti-backtracking ──
+        yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
+        yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
 
-        if effective_color == 'vermelho':
-            target = normalize_angle(self.current_yaw + math.pi / 2.0)
-            return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif effective_color == 'verde':
-            target = normalize_angle(self.current_yaw - math.pi / 2.0)
-            return target, -1.0, 'direita (parede VERDE)'
+        left_open  = self.left_max  > self.WALL_DETECT
+        right_open = self.right_max > self.WALL_DETECT
+
+        if left_open and not right_open:
+            return yaw_L, 1.0, f'esquerda (LiDAR: L aberto={self.left_max:.2f}m, R parede={self.right_max:.2f}m)'
+        elif right_open and not left_open:
+            return yaw_R, -1.0, f'direita (LiDAR: R aberto={self.right_max:.2f}m, L parede={self.left_max:.2f}m)'
+
+        # Ambos abertos ou ambos fechados → usa anti-backtracking
+        score_L = self._visited_score(yaw_L)
+        score_R = self._visited_score(yaw_R)
+        if score_L <= score_R:
+            return yaw_L, 1.0, f'esquerda (visitadas: L={score_L} R={score_R})'
         else:
-            yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
-            yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
-
-            left_open  = self.left_max  > self.WALL_DETECT
-            right_open = self.right_max > self.WALL_DETECT
-
-            if left_open and not right_open:
-                return yaw_L, 1.0, f'esquerda (LiDAR: L aberto={self.left_max:.2f}m, R parede={self.right_max:.2f}m)'
-            elif right_open and not left_open:
-                return yaw_R, -1.0, f'direita (LiDAR: R aberto={self.right_max:.2f}m, L parede={self.left_max:.2f}m)'
-
-            # Ambos abertos ou ambos fechados → usa anti-backtracking
-            score_L = self._visited_score(yaw_L)
-            score_R = self._visited_score(yaw_R)
-            if score_L <= score_R:
-                return yaw_L, 1.0, f'esquerda (visitadas: L={score_L} R={score_R})'
-            else:
-                return yaw_R, -1.0, f'direita (visitadas: L={score_L} R={score_R})'
+            return yaw_R, -1.0, f'direita (visitadas: L={score_L} R={score_R})'
 
     def _lateral_correction(self) -> float:
         """
@@ -515,8 +527,9 @@ class MazeNavigator(Node):
                     f'[NAV] TURNING concluído mas frente ainda bloqueada '
                     f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
             else:
-                # Saiu do bloqueio com sucesso → zera contador de becos
+                # Saiu do bloqueio com sucesso → zera contadores de becos
                 self.consecutive_blocks = 0
+                self.total_blocks = 0
                 self.state = 'FOLLOW_CORRIDOR'
                 self.get_logger().info(
                     f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
