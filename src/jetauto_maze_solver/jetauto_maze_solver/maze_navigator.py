@@ -49,10 +49,17 @@ class MazeNavigator(Node):
     R_SIDE_ANGLE, R_DIAG_ANGLE = math.radians(-90), math.radians(-45)
     L_SIDE_ANGLE, L_DIAG_ANGLE = math.radians(90), math.radians(45)
 
-    # Limiares de distância
-    FRONT_BLOCKED = 0.60    # Espaço seguro para o chassi girar sem colisões
-    WALL_DETECT   = 1.2     
-    TARGET_SIDE   = 0.40    
+    # ── Limiares de distância (metros) ─────────────────────────────
+    FRONT_BLOCKED = 0.7     # frente bloqueada → inicia COLOR_CHECK (antecipado)
+    SIDE_BLOCKED  = 0.7     # lateral bloqueada → critério de beco sem saída
+    WALL_DETECT   = 1.2     # considera parede presente se < este valor
+    TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
+
+    # ── Desaceleração proporcional à distância frontal ───────────────
+    # O robô começa a reduzir a velocidade quando front_dist < SLOW_DIST,
+    # chegando ao mínimo MIN_SPEED próximo de FRONT_BLOCKED.
+    SLOW_DIST  = 1.2    # metros — começa a desacelerar aqui
+    MIN_SPEED  = 0.05   # m/s — velocidade mínima antes de parar
 
     # Controle lateral — linear.y (Suavizado)
     KP_LAT    = 0.15
@@ -95,15 +102,31 @@ class MazeNavigator(Node):
         self.bridge = CvBridge()
         self.timer = self.create_timer(0.1, self._control_loop)
 
-        self.front_dist, self.left_dist, self.right_dist = self.RANGE_CAP, self.RANGE_CAP, self.RANGE_CAP
-        self.r_side, self.r_diag = self.RANGE_CAP, self.RANGE_CAP
-        self.l_side, self.l_diag = self.RANGE_CAP, self.RANGE_CAP
-        self.scan_ready, self.odom_ready = False, False
+        # ── LiDAR ──
+        self.front_dist = self.RANGE_CAP
+        self.left_dist  = self.RANGE_CAP
+        self.right_dist = self.RANGE_CAP
+        self.left_max   = self.RANGE_CAP
+        self.right_max  = self.RANGE_CAP
+        self.r_side = self.RANGE_CAP
+        self.r_diag = self.RANGE_CAP
+        self.l_side = self.RANGE_CAP
+        self.l_diag = self.RANGE_CAP
+        self.scan_ready = False
 
-        self.odom_x, self.odom_y, self.current_yaw = 0.0, 0.0, 0.0
+        # ── Odometria ──
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.current_yaw = 0.0
+        self.odom_ready = False
 
-        self.detected_color = None
-        self.lat_cmd = 0.0
+        # ── Câmera ──
+        self.detected_color = None   # 'vermelho', 'verde' ou None
+
+        # ── Controle lateral suavizado ──
+        self.lat_cmd = 0.0   # valor filtrado por EMA
+
+        # ── Anti-backtracking ──
         self.visited_cells: set = set()
 
         self.state = 'FOLLOW_CORRIDOR'
@@ -111,6 +134,8 @@ class MazeNavigator(Node):
         self.turn_direction = 0.0
         self.color_check_count = 0
         self.color_check_samples = []
+        self.consecutive_blocks  = 0   # giros seguidos sem cor com frente bloqueada
+        self.total_blocks        = 0   # todos os giros com frente bloqueada (inclui coloridos)
         self.loop_count = 0
 
         self.get_logger().info('[NAV] Maze Navigator Híbrido: Centralização OMNI + Memória')
@@ -132,6 +157,15 @@ class MazeNavigator(Node):
                 r = ranges[i]
                 if math.isfinite(r) and r >= self.LIDAR_MIN_VALID: best = min(best, min(r, self.RANGE_CAP))
             return best
+
+        def sector_max(lo, hi):
+            best = 0.0
+            for i in range(min(idx(lo), idx(hi)), max(idx(lo), idx(hi)) + 1):
+                r = ranges[i]
+                if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
+                    best = max(best, min(r, self.RANGE_CAP))
+            return best
+
         def ray_at(a):
             r = ranges[idx(a)]
             return min(r, self.RANGE_CAP) if math.isfinite(r) and r >= self.LIDAR_MIN_VALID else self.RANGE_CAP
@@ -139,8 +173,12 @@ class MazeNavigator(Node):
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.left_dist  = sector_min(self.LEFT_LO,  self.LEFT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
-        self.r_side, self.r_diag = ray_at(self.R_SIDE_ANGLE), ray_at(self.R_DIAG_ANGLE)
-        self.l_side, self.l_diag = ray_at(self.L_SIDE_ANGLE), ray_at(self.L_DIAG_ANGLE)
+        self.left_max   = sector_max(self.LEFT_LO,  self.LEFT_HI)
+        self.right_max  = sector_max(self.RIGHT_LO, self.RIGHT_HI)
+        self.r_side = ray_at(self.R_SIDE_ANGLE)
+        self.r_diag = ray_at(self.R_DIAG_ANGLE)
+        self.l_side = ray_at(self.L_SIDE_ANGLE)
+        self.l_diag = ray_at(self.L_DIAG_ANGLE)
         self.scan_ready = True
 
     def _image_cb(self, msg: Image):
@@ -169,30 +207,70 @@ class MazeNavigator(Node):
         return score
 
     def _choose_turn(self, color_decision: str):
+        """
+        Decide a direção do giro.
+
+        Prioridade:
+          0. Beco sem saída → U-turn 180°
+             Critério A (geométrico): nenhum raio lateral vê além de SIDE_BLOCKED
+             Critério B (contador):   frente bloqueada 2x consecutivas sem sair
+          1. VERMELHO → esquerda (+90°)
+          2. VERDE    → direita  (-90°)
+          3. Sem cor  → direção com menor score de células visitadas.
+                        Empate: esquerda.
+        """
+        # ── Beco sem saída com cor (loop detector) ──
+        # Se o robô fez muitos giros consecutivos (mesmo coloridos) sem sair,
+        # está preso num beco com parede colorida → força U-turn de emergência.
+        self.total_blocks += 1
+        if self.total_blocks >= 4:
+            self.total_blocks = 0
+            self.consecutive_blocks = 0
+            target = normalize_angle(self.current_yaw + math.pi)
+            self.get_logger().warn('[NAV] Beco detectado (loop com cor) → U-turn emergência')
+            return target, 1.0, 'U-turn 180° (loop com cor)'
+
+        # ── Cor da câmera (prioridade sobre deadend sem cor) ──
+        # Não incrementa consecutive_blocks para não confundir giro correto com beco.
+        if color_decision == 'vermelho':
+            target = normalize_angle(self.current_yaw + math.pi / 2.0)
+            return target, 1.0, 'esquerda (parede VERMELHA)'
+        elif color_decision == 'verde':
+            target = normalize_angle(self.current_yaw - math.pi / 2.0)
+            return target, -1.0, 'direita (parede VERDE)'
+
+        # ── Beco sem saída (sem cor) ──
+        geo_deadend   = (self.left_max  <= self.SIDE_BLOCKED
+                         and self.right_max <= self.SIDE_BLOCKED)
+        self.consecutive_blocks += 1
+        count_deadend = self.consecutive_blocks >= 2
+
+        if geo_deadend or count_deadend:
+            self.consecutive_blocks = 0
+            target = normalize_angle(self.current_yaw + math.pi)
+            reason = 'geométrico' if geo_deadend else 'bloqueio consecutivo'
+            self.get_logger().warn(f'[NAV] Beco detectado ({reason}) → U-turn')
+            return target, 1.0, f'U-turn 180° ({reason})'
+
+        # ── Sem cor: LiDAR + anti-backtracking ──
         yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
         yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
 
-        # 1. Hardware Override: Cores ditam a regra
-        if color_decision == 'vermelho': return yaw_L, 1.0, 'esquerda (parede VERMELHA)'
-        if color_decision == 'verde': return yaw_R, -1.0, 'direita (parede VERDE)'
+        left_open  = self.left_max  > self.WALL_DETECT
+        right_open = self.right_max > self.WALL_DETECT
 
-        # 2. Avaliação de Viabilidade (Não virar para paredes sólidas)
-        can_go_left  = self.left_dist > 0.8
-        can_go_right = self.right_dist > 0.8
+        if left_open and not right_open:
+            return yaw_L, 1.0, f'esquerda (LiDAR: L aberto={self.left_max:.2f}m, R parede={self.right_max:.2f}m)'
+        elif right_open and not left_open:
+            return yaw_R, -1.0, f'direita (LiDAR: R aberto={self.right_max:.2f}m, L parede={self.left_max:.2f}m)'
 
-        score_L, score_R = self._visited_score(yaw_L), self._visited_score(yaw_R)
-
-        # 3. Decisão baseada em Memória + Viabilidade
-        if can_go_left and can_go_right:
-            if score_L <= score_R: return yaw_L, 1.0, f'esquerda (L={score_L} vs R={score_R})'
-            else: return yaw_R, -1.0, f'direita (L={score_L} vs R={score_R})'
-        elif can_go_left:
-            return yaw_L, 1.0, 'esquerda (forçada, direita bloqueada)'
-        elif can_go_right:
-            return yaw_R, -1.0, 'direita (forçada, esquerda bloqueada)'
+        # Ambos abertos ou ambos fechados → usa anti-backtracking
+        score_L = self._visited_score(yaw_L)
+        score_R = self._visited_score(yaw_R)
+        if score_L <= score_R:
+            return yaw_L, 1.0, f'esquerda (visitadas: L={score_L} R={score_R})'
         else:
-            # Beco sem saída: vira 90°, na próxima iteração vira mais 90° (Meia-volta)
-            return yaw_L, 1.0, 'meia-volta parcial (beco sem saída)'
+            return yaw_R, -1.0, f'direita (visitadas: L={score_L} R={score_R})'
 
     def _lateral_correction(self) -> float:
         L, R = self.left_dist, self.right_dist
@@ -252,8 +330,33 @@ class MazeNavigator(Node):
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
 
-        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * self._lateral_correction()
-        twist.linear.x, twist.linear.y, twist.angular.z = self.FORWARD_SPEED, self.lat_cmd, self._heading_correction()
+        raw_lat = self._lateral_correction()
+        # Filtro EMA: suaviza oscilações laterais
+        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * raw_lat
+
+        # Velocidade proporcional: reduz à medida que se aproxima da parede frontal
+        if self.front_dist < self.SLOW_DIST:
+            t = (self.front_dist - self.FRONT_BLOCKED) / (self.SLOW_DIST - self.FRONT_BLOCKED)
+            t = max(0.0, min(1.0, t))
+            speed = self.MIN_SPEED + (self.FORWARD_SPEED - self.MIN_SPEED) * t
+        else:
+            speed = self.FORWARD_SPEED
+
+        twist.linear.x  = speed
+        twist.linear.y  = self.lat_cmd
+        twist.angular.z = self._heading_correction()
+
+        if self.loop_count % 20 == 0:
+            self.get_logger().info(
+                f'[NAV] FOLLOW_CORRIDOR  '
+                f'F={self.front_dist:.2f}m  '
+                f'L={self.left_dist:.2f}m  R={self.right_dist:.2f}m  '
+                f'vy={twist.linear.y:+.3f}  az={twist.angular.z:+.3f}  '
+                f'cor={self.detected_color}')
+
+    # ──────────────────────────────────────────────────────────────────
+    # ESTADO: COLOR_CHECK
+    # ──────────────────────────────────────────────────────────────────
 
     def _state_color_check(self, twist: Twist):
         if self.front_dist > self.FRONT_BLOCKED + 0.1:
@@ -273,41 +376,49 @@ class MazeNavigator(Node):
             self.get_logger().info(f'[NAV] Decisão: {desc}')
 
     def _state_turning(self, twist: Twist):
-        """
-        Fase 1: Gira cego usando odometria.
-        Fase 2: Faltando ~25 graus, tenta "grudar" na parede usando o LiDAR.
-        Fallback: Se não achar parede, conclui os 90 graus pela odometria.
-        """
-        odom_error = normalize_angle(self.target_yaw - self.current_yaw)
+        """Gira no lugar até atingir target_yaw com tolerância YAW_TOLERANCE."""
+        error = normalize_angle(self.target_yaw - self.current_yaw)
 
-        # Se já estiver a menos de 25 graus (0.43 rad) do alvo, tenta usar o LiDAR
-        if abs(odom_error) < math.radians(25):
-            wall_error = self._get_wall_alignment_error()
+        if abs(error) < self.YAW_TOLERANCE:
+            self.lat_cmd = 0.0  # zera suavização ao sair do giro
+            twist.linear.x  = 0.0
+            twist.linear.y  = 0.0
+            twist.angular.z = 0.0
 
-            # Se achou uma parede lateral confiável, faz o "Fechamento Magnético"
-            if wall_error is not None:
-                if abs(wall_error) < self.YAW_TOLERANCE:
-                    self.state = 'FOLLOW_CORRIDOR'
-                    self.lat_cmd = 0.0
-                    twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-                    self.get_logger().info(
-                        f'[NAV] Giro finalizado pelo LiDAR! Erro real: {math.degrees(wall_error):.1f}°')
-                else:
-                    # Gira suavemente até a parede ficar 100% reta
-                    twist.linear.x = twist.linear.y = 0.0
-                    twist.angular.z = max(-self.TURN_SPEED, min(self.ALIGN_KP * wall_error, self.TURN_SPEED))
-                return
-
-        # Fallback (Odometria Pura): Usado no início do giro OU se não houver parede perto para se alinhar
-        if abs(odom_error) < self.YAW_TOLERANCE:
-            self.state = 'FOLLOW_CORRIDOR'
-            self.lat_cmd = 0.0
-            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            self.get_logger().info(
-                f'[NAV] Giro finalizado por Odometria (sem parede). Erro Odom: {math.degrees(odom_error):.1f}°')
+            # Verificação pós-giro: frente ainda bloqueada?
+            # Pode indicar beco sem saída (precisa de +90°) ou drift acumulado.
+            # Volta ao COLOR_CHECK para reavaliar em vez de travar.
+            if self.front_dist <= self.FRONT_BLOCKED:
+                self.state = 'COLOR_CHECK'
+                self.color_check_count   = 0
+                self.color_check_samples = []
+                self.lat_cmd = 0.0
+                self.get_logger().warn(
+                    f'[NAV] TURNING concluído mas frente ainda bloqueada '
+                    f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
+            else:
+                # Saiu do bloqueio com sucesso → zera contadores de becos
+                self.consecutive_blocks = 0
+                self.total_blocks = 0
+                self.state = 'FOLLOW_CORRIDOR'
+                self.get_logger().info(
+                    f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}°  '
+                    f'erro_final={math.degrees(error):.1f}°')
         else:
-            twist.linear.x = twist.linear.y = 0.0
-            twist.angular.z = self.TURN_SPEED * self.turn_direction
+            twist.linear.x  = 0.0
+            twist.linear.y  = 0.0
+            twist.angular.z = self.TURN_SPEED * math.copysign(1.0, error)
+            if self.loop_count % 5 == 0:
+                self.get_logger().info(
+                    f'[NAV] TURNING  erro={math.degrees(error):.1f}°  '
+                    f'az={twist.angular.z:+.2f}  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}°  '
+                    f'target={math.degrees(self.target_yaw):.1f}°')
+
+    # ──────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ──────────────────────────────────────────────────────────────────
 
     def destroy_node(self):
         self.cmd_pub.publish(Twist())
