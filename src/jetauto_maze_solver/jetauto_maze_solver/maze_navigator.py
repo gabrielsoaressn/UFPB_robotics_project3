@@ -153,6 +153,8 @@ class MazeNavigator(Node):
         self.front_dist = self.RANGE_CAP
         self.left_dist  = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
+        self.left_max   = self.RANGE_CAP   # maior leitura no setor esquerdo
+        self.right_max  = self.RANGE_CAP   # maior leitura no setor direito
         self.r_side = self.RANGE_CAP
         self.r_diag = self.RANGE_CAP
         self.l_side = self.RANGE_CAP
@@ -320,9 +322,12 @@ class MazeNavigator(Node):
           3. Sem cor  → direção com menor score de células visitadas
                         (anti-backtracking). Empate: esquerda.
         """
-        # ── Beco sem saída: todas as três direções bloqueadas ──
-        if (self.left_dist <= self.SIDE_BLOCKED
-                and self.right_dist <= self.SIDE_BLOCKED):
+        # ── Beco sem saída: nenhuma abertura lateral ──
+        # Usa sector_max: se qualquer raio lateral enxerga longe (> SIDE_BLOCKED),
+        # existe um corredor aberto → NÃO é beco. Só faz U-turn se nenhum
+        # lado tem abertura, i.e., o máximo de ambos os setores é pequeno.
+        if (self.left_max <= self.SIDE_BLOCKED
+                and self.right_max <= self.SIDE_BLOCKED):
             target = normalize_angle(self.current_yaw + math.pi)
             return target, 1.0, 'U-turn 180° (beco sem saída)'
 
