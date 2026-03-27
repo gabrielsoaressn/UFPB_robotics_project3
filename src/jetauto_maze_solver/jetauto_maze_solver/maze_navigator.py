@@ -64,8 +64,8 @@ class MazeNavigator(Node):
     ALIGN_CLAMP = 0.15
 
     # Velocidades
-    FORWARD_SPEED = 0.15
-    TURN_SPEED    = 0.4
+    FORWARD_SPEED = 0.25
+    TURN_SPEED    = 0.7
     YAW_TOLERANCE = 0.05
 
     RANGE_CAP       = 3.0
