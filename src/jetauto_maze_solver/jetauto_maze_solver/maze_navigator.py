@@ -73,6 +73,7 @@ class MazeNavigator(Node):
 
     # ── Limiares de distância (metros) ─────────────────────────────
     FRONT_BLOCKED = 0.7     # frente bloqueada → inicia COLOR_CHECK (antecipado)
+    SIDE_BLOCKED  = 0.6     # lateral bloqueada para detecção de beco sem saída
     WALL_DETECT   = 1.2     # considera parede presente se < este valor
     TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
 
@@ -272,11 +273,18 @@ class MazeNavigator(Node):
         Decide a direção do giro.
 
         Prioridade:
+          0. Beco sem saída (frente + esq + dir bloqueadas) → U-turn 180°
           1. VERMELHO → esquerda (+90°)
           2. VERDE    → direita  (-90°)
           3. Sem cor  → direção com menor score de células visitadas
                         (anti-backtracking). Empate: esquerda.
         """
+        # ── Beco sem saída: todas as três direções bloqueadas ──
+        if (self.left_dist <= self.SIDE_BLOCKED
+                and self.right_dist <= self.SIDE_BLOCKED):
+            target = normalize_angle(self.current_yaw + math.pi)
+            return target, 1.0, 'U-turn 180° (beco sem saída)'
+
         if color_decision == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
             return target, 1.0, 'esquerda (parede VERMELHA)'
