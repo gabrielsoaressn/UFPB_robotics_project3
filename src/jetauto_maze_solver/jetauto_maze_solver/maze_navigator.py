@@ -21,14 +21,17 @@ Topicos:
 """
 
 import math
-import numpy as np
-import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
+
+from jetauto_maze_solver.camera_color_config import (
+    COLOR_MIN_AREA_FRAC as _CAM_COLOR_MIN_AREA_FRAC,
+    dominant_wall_color_from_bgr,
+)
 
 
 # =====================================================================
@@ -96,16 +99,8 @@ class MazeNavigator(Node):
     ADVANCE_SECS       = 1.5   # segundos avancando apos curva
     TURN_COOLDOWN_SECS = 2.0   # cooldown antes de checar parede aberta de novo
 
-    # -- Camera -- faixas HSV --
-    COLOR_MIN_AREA_FRAC = 0.05
-    RED_LOWER1   = np.array([0,   80,  50])
-    RED_UPPER1   = np.array([10,  255, 255])
-    RED_LOWER2   = np.array([170, 80,  50])
-    RED_UPPER2   = np.array([180, 255, 255])
-    GREEN_LOWER  = np.array([40,  80,  50])
-    GREEN_UPPER  = np.array([85,  255, 255])
-    BLUE_LOWER   = np.array([100, 80,  50])
-    BLUE_UPPER   = np.array([130, 255, 255])
+    # -- Camera (same HSV / area rules as color_wall_counter via camera_color_config) --
+    COLOR_MIN_AREA_FRAC = _CAM_COLOR_MIN_AREA_FRAC
 
     def __init__(self):
         super().__init__('maze_navigator')
@@ -193,35 +188,17 @@ class MazeNavigator(Node):
         self.scan_ready = True
 
     def _image_cb(self, msg: Image):
-        """Detecta cor dominante (vermelho/verde/azul) no frame atual."""
+        """Detecta cor dominante (vermelho/verde/azul) — mesma logica que color_wall_counter."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f'[NAV] cv_bridge: {e}')
             return
 
-        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        h, w = hsv.shape[:2]
-        min_area = self.COLOR_MIN_AREA_FRAC * h * w
-
-        mask_r = cv2.bitwise_or(
-            cv2.inRange(hsv, self.RED_LOWER1, self.RED_UPPER1),
-            cv2.inRange(hsv, self.RED_LOWER2, self.RED_UPPER2))
-        red_area   = cv2.countNonZero(mask_r)
-        green_area = cv2.countNonZero(
-            cv2.inRange(hsv, self.GREEN_LOWER, self.GREEN_UPPER))
-        blue_area  = cv2.countNonZero(
-            cv2.inRange(hsv, self.BLUE_LOWER, self.BLUE_UPPER))
-
-        best_area = max(red_area, green_area, blue_area)
-        if best_area < min_area:
-            self.detected_color = None
-        elif best_area == red_area:
-            self.detected_color = 'vermelho'
-        elif best_area == green_area:
-            self.detected_color = 'verde'
-        else:
-            self.detected_color = 'azul'
+        c, _, _ = dominant_wall_color_from_bgr(
+            cv_image, min_area_fraction=self.COLOR_MIN_AREA_FRAC
+        )
+        self.detected_color = c
 
     # =================================================================
     # Calculos de controle

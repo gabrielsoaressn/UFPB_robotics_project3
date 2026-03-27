@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Vision — colored wall detection and counting (passive).
+Colored wall counting for Gazebo + maze_navigator stack (no RViz required).
 
-Replicates the wall deduplication strategy from robotics_subject color_detector_node
-(robotica-main): wall position is estimated by projecting LiDAR range at the bearing
-that matches the color blob centroid in the camera frame, then deduplicating with
-a larger distance threshold when the robot faces the opposite direction (~same
-physical wall, other face).
+Uses the same camera rules as maze_navigator (camera_color_config): HSV bands,
+minimum area fraction, winner selection. LiDAR + centroid bearing is only used
+here to estimate wall pose and deduplicate front/back views.
 
-This node never publishes cmd_vel.
-
-Subscriptions (defaults match UFPB Gazebo URDF):
-  image_topic: /jetauto/camera/image_raw
-  odom_topic:  /odometry/filtered
-  scan_topic:  /jetauto/lidar/scan
+Optional: publish /jetauto/camera/color_debug for rqt_image_view (off by default).
 """
+
+from __future__ import annotations
 
 import math
 import os
@@ -27,6 +22,11 @@ from cv_bridge import CvBridge
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
+
+from jetauto_maze_solver.camera_color_config import (
+    COLOR_MIN_AREA_FRAC,
+    dominant_wall_color_from_bgr,
+)
 
 
 def yaw_from_quat(q) -> float:
@@ -43,7 +43,6 @@ def range_at(
     window_deg: float = 15.0,
     max_r: float = 3.0,
 ) -> float:
-    """Smallest valid LiDAR reading in a window centered at deg (robot frame)."""
     rad = math.radians(deg)
     hw = math.radians(window_deg)
     vals = [
@@ -54,38 +53,22 @@ def range_at(
     return min(vals) if vals else max_r
 
 
+_PT_ORDER = ('vermelho', 'verde', 'azul')
+_COLOR_LABELS = {'azul': 'A', 'verde': 'V', 'vermelho': 'R'}
+
+_COLOR_BGR = {
+    'vermelho': (0, 0, 255),
+    'verde': (0, 255, 0),
+    'azul': (255, 0, 0),
+}
+
+
 class ColorWallCounter(Node):
-    # Same spirit as robotica-main color_detector_node
     WALL_DEDUPE_DIST = 2.0
     WALL_DEDUPE_DIST_BACK = 3.0
     WALL_MAX_PROJ = 1.925
-    MIN_COLOR_RATIO = 0.06
-    # depth_camera.urdf.xacro (UFPB): horizontal_fov 1.2 rad
+    # UFPB depth_camera.urdf.xacro horizontal_fov
     CAMERA_HFOV = 1.2
-
-    MAX_SPEED = 0.05
-    MAX_ANGULAR_SPEED = 0.1
-    # Optional: require blob centroid near image center (reduces side-wall triggers)
-    CENTER_TOL = 0.25
-
-    COLOR_RANGES = {
-        'vermelho': [
-            (np.array([0, 120, 80]), np.array([10, 255, 255])),
-            (np.array([168, 120, 80]), np.array([180, 255, 255])),
-        ],
-        'verde': [
-            (np.array([40, 90, 80]), np.array([85, 255, 255])),
-        ],
-        'azul': [
-            (np.array([100, 90, 80]), np.array([135, 255, 255])),
-        ],
-    }
-
-    COLOR_LABELS = {
-        'azul': 'A',
-        'verde': 'V',
-        'vermelho': 'R',
-    }
 
     def __init__(self):
         super().__init__('color_wall_counter')
@@ -96,108 +79,119 @@ class ColorWallCounter(Node):
         self.declare_parameter('wall_dedupe_dist', self.WALL_DEDUPE_DIST)
         self.declare_parameter('wall_dedupe_dist_back', self.WALL_DEDUPE_DIST_BACK)
         self.declare_parameter('wall_max_proj', self.WALL_MAX_PROJ)
-        self.declare_parameter('min_color_ratio', self.MIN_COLOR_RATIO)
         self.declare_parameter('camera_hfov', self.CAMERA_HFOV)
-        self.declare_parameter('lidar_window_deg', 8.0)
+        self.declare_parameter('color_min_area_fraction', COLOR_MIN_AREA_FRAC)
+        self.declare_parameter('publish_debug_image', False)
 
         img_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
         scan_topic = self.get_parameter('scan_topic').get_parameter_value().string_value
-        self.WALL_DEDUPE_DIST = self.get_parameter('wall_dedupe_dist').value
-        self.WALL_DEDUPE_DIST_BACK = self.get_parameter('wall_dedupe_dist_back').value
-        self.WALL_MAX_PROJ = self.get_parameter('wall_max_proj').value
-        self.MIN_COLOR_RATIO = self.get_parameter('min_color_ratio').value
-        self.CAMERA_HFOV = self.get_parameter('camera_hfov').value
-        self._lidar_window_deg = self.get_parameter('lidar_window_deg').value
+        self.WALL_DEDUPE_DIST = float(self.get_parameter('wall_dedupe_dist').value)
+        self.WALL_DEDUPE_DIST_BACK = float(self.get_parameter('wall_dedupe_dist_back').value)
+        self.WALL_MAX_PROJ = float(self.get_parameter('wall_max_proj').value)
+        self.CAMERA_HFOV = float(self.get_parameter('camera_hfov').value)
+        self._min_area_frac = float(self.get_parameter('color_min_area_fraction').value)
+        self._publish_debug = self.get_parameter('publish_debug_image').value
 
         self.bridge = CvBridge()
         self.create_subscription(Image, img_topic, self._image_cb, 10)
         self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
         self.create_subscription(LaserScan, scan_topic, self._scan_cb, 10)
 
-        self.counts = {c: 0 for c in self.COLOR_RANGES}
-        self.detection_positions = {c: [] for c in self.COLOR_RANGES}
+        self.debug_pub = self.create_publisher(Image, '/jetauto/camera/color_debug', 10)
 
-        self.robot_x = 0.0
-        self.robot_y = 0.0
-        self.robot_yaw = 0.0
-        self.robot_speed = 0.0
-        self.robot_angular_speed = 0.0
-        self.odom_ready = False
+        self.current_pose = None
         self.latest_scan = None
-
-        # Edge-trigger: first frame a color appears (avoids counting every image)
         self._prev_color = None
-        # (wall_x, wall_y, robot_yaw_at_detection, color_key)
         self._seen_walls = []
 
+        self.counts = {k: 0 for k in _PT_ORDER}
+        self.detection_positions = {k: [] for k in _PT_ORDER}
+
         self.get_logger().info(
-            '[VISAO] Color wall counter — LiDAR+camera wall pose + angle-aware dedupe'
-        )
-        self.get_logger().info(
-            f'[VISAO] image={img_topic} scan={scan_topic} | '
-            f'dedupe={self.WALL_DEDUPE_DIST}m / back={self.WALL_DEDUPE_DIST_BACK}m'
+            f'color_wall_counter — aligned with maze_navigator camera; '
+            f'image={img_topic} scan={scan_topic} hfov={self.CAMERA_HFOV:.4f} '
+            f'min_area_frac={self._min_area_frac} debug_image={self._publish_debug}'
         )
 
     def _odom_cb(self, msg: Odometry):
-        self.robot_x = msg.pose.pose.position.x
-        self.robot_y = msg.pose.pose.position.y
-        self.robot_yaw = yaw_from_quat(msg.pose.pose.orientation)
-        vx = msg.twist.twist.linear.x
-        vy = msg.twist.twist.linear.y
-        self.robot_speed = math.hypot(vx, vy)
-        self.robot_angular_speed = abs(msg.twist.twist.angular.z)
-        self.odom_ready = True
+        self.current_pose = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            yaw_from_quat(msg.pose.pose.orientation),
+        )
 
     def _scan_cb(self, msg: LaserScan):
         self.latest_scan = msg
 
-    def _detect_dominant_color(self, bgr: np.ndarray):
-        """
-        Returns (color_key | None, masks dict, centroid_x normalized [-0.5, 0.5]).
-        """
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        total = bgr.shape[0] * bgr.shape[1]
+    def _publish_debug_image(self, bgr: np.ndarray, masks: dict, detected: str | None):
+        if not self._publish_debug:
+            return
+        overlay = bgr.copy()
         h, w = bgr.shape[:2]
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        cv2.line(overlay, (w // 2, 0), (w // 2, h), (80, 80, 80), 1)
 
-        masks = {}
-        ratios = {}
-        for name, ranges in self.COLOR_RANGES.items():
-            m = np.zeros((h, w), dtype=np.uint8)
-            for lo, hi in ranges:
-                m = cv2.bitwise_or(m, cv2.inRange(hsv, lo, hi))
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
-            masks[name] = m
-            ratios[name] = cv2.countNonZero(m) / total
-
-        best = max(ratios, key=ratios.get)
-        if ratios[best] < self.MIN_COLOR_RATIO:
-            return None, masks, None
-
-        M = cv2.moments(masks[best])
-        if M['m00'] <= 0:
-            return None, masks, None
-        cx_px = M['m10'] / M['m00']
-        if abs(cx_px - w / 2.0) > self.CENTER_TOL * w:
-            return None, masks, None
-
-        centroid_x = (cx_px - w / 2.0) / w
-        return best, masks, centroid_x
+        if detected is not None and detected in masks:
+            mask = masks[detected]
+            clr = _COLOR_BGR[detected]
+            tint = np.zeros_like(bgr)
+            tint[mask > 0] = clr
+            cv2.addWeighted(tint, 0.5, overlay, 0.5, 0, overlay)
+            cv2.putText(
+                overlay,
+                detected.upper(),
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                clr,
+                2,
+            )
+            M = cv2.moments(mask)
+            if M['m00'] > 0:
+                cx_px = int(M['m10'] / M['m00'])
+                cy_px = int(M['m01'] / M['m00'])
+                norm_x = (cx_px - w / 2.0) / w
+                lidar_deg = -norm_x * math.degrees(self.CAMERA_HFOV)
+                cv2.drawMarker(overlay, (cx_px, cy_px), clr, cv2.MARKER_CROSS, 20, 2)
+                cv2.line(overlay, (w // 2, cy_px), (cx_px, cy_px), clr, 1)
+                cv2.putText(
+                    overlay,
+                    f'lidar {lidar_deg:+.1f}deg',
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    clr,
+                    2,
+                )
+        else:
+            cv2.putText(
+                overlay,
+                'Sem cor',
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (200, 200, 200),
+                2,
+            )
+        try:
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(overlay, 'bgr8'))
+        except Exception:
+            pass
 
     def _image_cb(self, msg: Image):
-        if not self.odom_ready:
-            return
-        if self.robot_speed > self.MAX_SPEED or self.robot_angular_speed > self.MAX_ANGULAR_SPEED:
+        if self.current_pose is None:
             return
 
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception as e:
-            self.get_logger().error(f'[VISAO] cv_bridge: {e}')
+        except Exception as exc:
+            self.get_logger().warn(f'cv_bridge error: {exc}')
             return
 
-        color, _masks, centroid_x = self._detect_dominant_color(bgr)
+        color, masks, centroid_x = dominant_wall_color_from_bgr(
+            bgr, min_area_fraction=self._min_area_frac
+        )
+        self._publish_debug_image(bgr, masks, color)
 
         if color is None:
             self._prev_color = None
@@ -212,7 +206,7 @@ class ColorWallCounter(Node):
             lidar_rad = -centroid_x * self.CAMERA_HFOV
             lidar_deg = math.degrees(lidar_rad)
 
-        rx, ry, ryaw = self.robot_x, self.robot_y, self.robot_yaw
+        rx, ry, ryaw = self.current_pose
         if self.latest_scan is not None:
             scan = self.latest_scan
             dist = range_at(
@@ -220,36 +214,18 @@ class ColorWallCounter(Node):
                 scan.angle_min,
                 scan.angle_increment,
                 lidar_deg,
-                window_deg=self._lidar_window_deg,
+                window_deg=8.0,
                 max_r=self.WALL_MAX_PROJ,
             )
             dist = min(dist, self.WALL_MAX_PROJ)
         else:
             dist = self.WALL_MAX_PROJ
-            self.get_logger().warn('[VISAO] No LiDAR yet — using wall_max_proj fallback')
 
         wall_angle = ryaw + math.radians(lidar_deg)
         wall_x = rx + dist * math.cos(wall_angle)
         wall_y = ry + dist * math.sin(wall_angle)
 
-        if self._is_duplicate_wall(color, wall_x, wall_y, ryaw):
-            self.get_logger().debug(
-                f'[VISAO] {color}: duplicate wall at ({wall_x:.2f},{wall_y:.2f}) — skip'
-            )
-            return
-
-        self._seen_walls.append((wall_x, wall_y, ryaw, color))
-        self.counts[color] += 1
-        self.detection_positions[color].append((wall_x, wall_y))
-
-        placar = self._format_placar()
-        self.get_logger().info(
-            f'[VISAO] Parede {color.upper()} — '
-            f'robo=({rx:.2f},{ry:.2f}) parede≈({wall_x:.2f},{wall_y:.2f}) '
-            f'dist_lidar={dist:.2f}m | Placar: {placar}'
-        )
-
-    def _is_duplicate_wall(self, color: str, wall_x: float, wall_y: float, ryaw: float) -> bool:
+        already = False
         for wx, wy, wyaw, wc in self._seen_walls:
             if wc != color:
                 continue
@@ -263,35 +239,42 @@ class ColorWallCounter(Node):
                 else self.WALL_DEDUPE_DIST
             )
             if dist_to_known < threshold:
-                return True
-        return False
+                already = True
+                break
+
+        if already:
+            return
+
+        self._seen_walls.append((wall_x, wall_y, ryaw, color))
+        self.counts[color] += 1
+        self.detection_positions[color].append((wall_x, wall_y))
+
+        placar = self._format_placar()
+        self.get_logger().info(
+            f'[VISAO] Parede {color.upper()} — '
+            f'wall≈({wall_x:.2f},{wall_y:.2f}) dist={dist:.2f}m | {placar}'
+        )
 
     def _format_placar(self) -> str:
-        parts = []
-        for c in self.COLOR_RANGES:
-            parts.append(f'{self.COLOR_LABELS[c]}:{self.counts[c]}')
-        return ', '.join(parts)
+        return ', '.join(f'{_COLOR_LABELS[k]}:{self.counts[k]}' for k in _PT_ORDER)
 
     def _save_report(self):
         report_path = os.path.join(os.getcwd(), 'color_wall_report.txt')
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         total = sum(self.counts.values())
-
         lines = [
             '=== Relatorio de Paredes Coloridas ===',
             f'Data/hora: {timestamp}',
             '',
             'Contagem por cor:',
         ]
-        for c in self.COLOR_RANGES:
-            lines.append(f'  {c.capitalize():10s}: {self.counts[c]}')
-            for i, (wx, wy) in enumerate(self.detection_positions[c], 1):
+        for k in _PT_ORDER:
+            lines.append(f'  {k.capitalize():10s}: {self.counts[k]}')
+            for i, (wx, wy) in enumerate(self.detection_positions[k], 1):
                 lines.append(f'    #{i} parede estimada em ({wx:.1f}, {wy:.1f})')
         lines += ['', f'Total de paredes detectadas: {total}']
-
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
-
         self.get_logger().info(f'[VISAO] Relatorio salvo em {report_path}')
 
 

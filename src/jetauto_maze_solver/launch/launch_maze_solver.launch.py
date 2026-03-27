@@ -17,6 +17,11 @@ def generate_launch_description():
             executable='color_wall_counter',
             name='color_wall_counter',
             output='screen',
-            parameters=[{'use_sim_time': True}],
+            parameters=[{
+                'use_sim_time': True,
+                'camera_hfov': 1.2,
+                # Gazebo only: keep false. Set true + rqt_image_view on /jetauto/camera/color_debug to tune vision.
+                'publish_debug_image': False,
+            }],
         ),
     ])
