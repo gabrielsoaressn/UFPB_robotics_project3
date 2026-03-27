@@ -72,9 +72,15 @@ class MazeNavigator(Node):
     L_DIAG_ANGLE = math.radians(45)
 
     # ── Limiares de distância (metros) ─────────────────────────────
-    FRONT_BLOCKED = 0.5
+    FRONT_BLOCKED = 0.7     # frente bloqueada → inicia COLOR_CHECK (antecipado)
     WALL_DETECT   = 1.2     # considera parede presente se < este valor
     TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
+
+    # ── Desaceleração proporcional à distância frontal ───────────────
+    # O robô começa a reduzir a velocidade quando front_dist < SLOW_DIST,
+    # chegando ao mínimo MIN_SPEED próximo de FRONT_BLOCKED.
+    SLOW_DIST  = 1.2    # metros — começa a desacelerar aqui
+    MIN_SPEED  = 0.05   # m/s — velocidade mínima antes de parar
 
     # ── Controle lateral — linear.y ─────────────────────────────────
     KP_LAT    = 0.15    # ganho proporcional (reduzido para suavidade)
@@ -98,6 +104,15 @@ class MazeNavigator(Node):
     # Número de ciclos (10 Hz) em que o robô fica parado amostrado a cor
     # antes de decidir a direção do giro. 5 ciclos = 0.5 s.
     COLOR_CHECK_CYCLES = 5
+
+    # ── ALIGN (realinhamento pós-giro com paredes do LiDAR) ──────────
+    # Após o giro de ~90° por odometria, o robô avança devagar enquanto
+    # aplica _heading_correction() até o erro angular ser estável e pequeno.
+    # Isso elimina o drift acumulado usando a geometria real das paredes.
+    ALIGN_DONE_THRESH  = 0.015   # rad — correção considerada "zero" (~0.9°)
+    ALIGN_DONE_CYCLES  = 6       # ciclos consecutivos abaixo do limiar para sair
+    ALIGN_TIMEOUT      = 40      # ciclos máximos (4 s) antes de desistir
+    ALIGN_FWD_SPEED    = 0.06    # m/s — velocidade de avanço durante alinhamento
 
     # ── Anti-backtracking (células visitadas) ───────────────────────
     CELL_SIZE       = 0.4   # tamanho da célula do grid (metros)
@@ -154,6 +169,8 @@ class MazeNavigator(Node):
         self.turn_direction  = 0.0   # +1 = esquerda, -1 = direita
         self.color_check_count   = 0
         self.color_check_samples = []
+        self.align_stable_count  = 0   # ciclos consecutivos com erro pequeno
+        self.align_total_count   = 0   # ciclos totais no estado ALIGN
         self.loop_count = 0
 
         self.get_logger().info(
@@ -345,6 +362,8 @@ class MazeNavigator(Node):
             self._state_color_check(twist)
         elif self.state == 'TURNING':
             self._state_turning(twist)
+        elif self.state == 'ALIGN':
+            self._state_align(twist)
         else:
             self._state_follow_corridor(twist)
 
@@ -378,7 +397,15 @@ class MazeNavigator(Node):
         # Filtro EMA: suaviza oscilações laterais
         self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * raw_lat
 
-        twist.linear.x  = self.FORWARD_SPEED
+        # Velocidade proporcional: reduz à medida que se aproxima da parede frontal
+        if self.front_dist < self.SLOW_DIST:
+            t = (self.front_dist - self.FRONT_BLOCKED) / (self.SLOW_DIST - self.FRONT_BLOCKED)
+            t = max(0.0, min(1.0, t))
+            speed = self.MIN_SPEED + (self.FORWARD_SPEED - self.MIN_SPEED) * t
+        else:
+            speed = self.FORWARD_SPEED
+
+        twist.linear.x  = speed
         twist.linear.y  = self.lat_cmd
         twist.angular.z = self._heading_correction()
 
@@ -441,15 +468,27 @@ class MazeNavigator(Node):
         error = normalize_angle(self.target_yaw - self.current_yaw)
 
         if abs(error) < self.YAW_TOLERANCE:
-            self.state = 'FOLLOW_CORRIDOR'
-            self.lat_cmd = 0.0  # zera suavização ao sair do giro
-            self.get_logger().info(
-                f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
-                f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                f'erro_final={math.degrees(error):.1f}°')
+            self.lat_cmd = 0.0
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
             twist.angular.z = 0.0
+
+            # Verificação pós-giro: frente ainda bloqueada?
+            if self.front_dist <= self.FRONT_BLOCKED:
+                self.state = 'COLOR_CHECK'
+                self.color_check_count   = 0
+                self.color_check_samples = []
+                self.get_logger().warn(
+                    f'[NAV] TURNING concluído mas frente ainda bloqueada '
+                    f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
+            else:
+                # Giro concluído → ALIGN para corrigir drift com as paredes reais
+                self.state = 'ALIGN'
+                self.align_stable_count = 0
+                self.align_total_count  = 0
+                self.get_logger().info(
+                    f'[NAV] TURNING concluído → ALIGN  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}°')
         else:
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
@@ -460,6 +499,77 @@ class MazeNavigator(Node):
                     f'az={twist.angular.z:+.2f}  '
                     f'yaw={math.degrees(self.current_yaw):.1f}°  '
                     f'target={math.degrees(self.target_yaw):.1f}°')
+
+    # ──────────────────────────────────────────────────────────────────
+    # ESTADO: ALIGN (Realinhamento pós-giro com paredes do LiDAR)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _state_align(self, twist: Twist):
+        """
+        Após o giro de ~90° por odometria, avança devagar aplicando a
+        correção de heading baseada nas paredes reais do LiDAR.
+
+        Saída normal: correção angular cai abaixo de ALIGN_DONE_THRESH
+        por ALIGN_DONE_CYCLES ciclos consecutivos → o robô está paralelo
+        ao corredor e o drift acumulado foi eliminado.
+
+        Saída por timeout: se não alinhar em ALIGN_TIMEOUT ciclos (4 s),
+        segue mesmo assim para não travar.
+
+        Segurança: se a frente bloquear durante o avanço, vai para COLOR_CHECK.
+        """
+        self.align_total_count += 1
+
+        # Segurança: parede na frente durante alinhamento
+        if self.front_dist <= self.FRONT_BLOCKED:
+            self.state = 'COLOR_CHECK'
+            self.color_check_count   = 0
+            self.color_check_samples = []
+            self.lat_cmd = 0.0
+            self.get_logger().info(
+                f'[NAV] ALIGN interrompido (frente bloqueada F={self.front_dist:.2f}m)'
+                f' → COLOR_CHECK')
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+            return
+
+        az = self._heading_correction()
+
+        # Conta ciclos consecutivos com correção pequena
+        if abs(az) < self.ALIGN_DONE_THRESH:
+            self.align_stable_count += 1
+        else:
+            self.align_stable_count = 0   # reinicia contagem se erro subiu
+
+        # Saída: estável por N ciclos consecutivos
+        if self.align_stable_count >= self.ALIGN_DONE_CYCLES:
+            self.state = 'FOLLOW_CORRIDOR'
+            self.lat_cmd = 0.0
+            self.get_logger().info(
+                f'[NAV] ALIGN concluído → FOLLOW_CORRIDOR  '
+                f'yaw={math.degrees(self.current_yaw):.1f}°  '
+                f'ciclos={self.align_total_count}')
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+            return
+
+        # Saída por timeout
+        if self.align_total_count >= self.ALIGN_TIMEOUT:
+            self.state = 'FOLLOW_CORRIDOR'
+            self.lat_cmd = 0.0
+            self.get_logger().warn(
+                f'[NAV] ALIGN timeout ({self.ALIGN_TIMEOUT} ciclos) → FOLLOW_CORRIDOR')
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+            return
+
+        # Avança devagar enquanto corrige o heading
+        twist.linear.x  = self.ALIGN_FWD_SPEED
+        twist.linear.y  = 0.0   # sem correção lateral durante alinhamento
+        twist.angular.z = az
+
+        if self.loop_count % 5 == 0:
+            self.get_logger().info(
+                f'[NAV] ALIGN  az={az:+.4f}  '
+                f'estável={self.align_stable_count}/{self.ALIGN_DONE_CYCLES}  '
+                f'ciclos={self.align_total_count}/{self.ALIGN_TIMEOUT}')
 
     # ──────────────────────────────────────────────────────────────────
     # Cleanup
