@@ -64,9 +64,16 @@ class MazeNavigator(Node):
     ALIGN_CLAMP = 0.15
 
     # Velocidades
-    FORWARD_SPEED = 0.15
-    TURN_SPEED    = 0.4
-    YAW_TOLERANCE = 0.05
+    FORWARD_SPEED  = 0.15
+    TURN_MAX_SPEED = 0.35   # velocidade máxima de giro (proporcional)
+    TURN_MIN_SPEED = 0.10   # velocidade mínima para garantir chegada ao alvo
+    TURN_KP        = 2.0    # ganho proporcional do giro
+    YAW_TOLERANCE  = 0.05
+
+    # Centralização pós-curva
+    CENTER_LAT_TOL    = 0.03  # tolerância de erro lateral (m)
+    CENTER_HDG_TOL    = 0.04  # tolerância de erro de heading (rad)
+    MAX_CENTER_CYCLES = 30    # timeout (~3 s a 10 Hz)
 
     RANGE_CAP       = 3.0
     LIDAR_MIN_VALID = 0.15
@@ -113,6 +120,7 @@ class MazeNavigator(Node):
         self.color_check_count = 0
         self.color_check_samples = []
         self.loop_count = 0
+        self.centering_count = 0
 
         self.get_logger().info('[NAV] Maze Navigator Híbrido: Centralização OMNI + Memória')
 
@@ -241,6 +249,7 @@ class MazeNavigator(Node):
 
         if self.state == 'COLOR_CHECK': self._state_color_check(twist)
         elif self.state == 'TURNING': self._state_turning(twist)
+        elif self.state == 'CENTERING': self._state_centering(twist)
         else: self._state_follow_corridor(twist)
 
         self.cmd_pub.publish(twist)
@@ -282,18 +291,45 @@ class MazeNavigator(Node):
             self.get_logger().info(f'[NAV] Decisão: {desc} | frente={len(colored)} amostras, lateral={lateral}')
 
     def _state_turning(self, twist: Twist):
-        """Gira pela odometria até atingir target_yaw."""
+        """Gira com controle proporcional até atingir target_yaw, depois centraliza."""
         odom_error = normalize_angle(self.target_yaw - self.current_yaw)
 
         if abs(odom_error) < self.YAW_TOLERANCE:
-            self.state = 'FOLLOW_CORRIDOR'
+            self.state = 'CENTERING'
+            self.centering_count = 0
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             self.get_logger().info(
-                f'[NAV] Giro finalizado. Erro: {math.degrees(odom_error):.1f}°')
+                f'[NAV] Giro finalizado ({math.degrees(odom_error):.1f}°). Centralizando...')
         else:
+            # Proporcional: desacelera suavemente ao aproximar do alvo
+            raw = self.TURN_KP * odom_error
+            speed = max(self.TURN_MIN_SPEED, min(abs(raw), self.TURN_MAX_SPEED))
             twist.linear.x = twist.linear.y = 0.0
-            twist.angular.z = self.TURN_SPEED * self.turn_direction
+            twist.angular.z = math.copysign(speed, raw)
+
+    def _state_centering(self, twist: Twist):
+        """Após curva: ajusta lateral e heading para ficar equidistante das paredes."""
+        lat_raw = self._lateral_correction()
+        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * lat_raw
+        hdg = self._heading_correction()
+
+        self.centering_count += 1
+        centered  = abs(lat_raw) < self.CENTER_LAT_TOL and abs(hdg) < self.CENTER_HDG_TOL
+        timed_out = self.centering_count >= self.MAX_CENTER_CYCLES
+
+        if centered or timed_out:
+            reason = 'centralizado' if centered else 'timeout'
+            self.state = 'FOLLOW_CORRIDOR'
+            self.lat_cmd = 0.0
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+            self.get_logger().info(f'[NAV] Centralização concluída ({reason})')
+            return
+
+        # Fica parado longitudinalmente; corrige lateral e heading
+        twist.linear.x = 0.0
+        twist.linear.y = self.lat_cmd
+        twist.angular.z = hdg
 
     def destroy_node(self):
         self.cmd_pub.publish(Twist())
