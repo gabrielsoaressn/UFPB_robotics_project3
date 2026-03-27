@@ -279,6 +279,8 @@ class MazeNavigator(Node):
 
         twist.linear.x = twist.linear.y = twist.angular.z = 0.0
         self.color_check_samples.append(self.detected_color)
+        if self.detected_color is not None:
+            self.approach_color = self.detected_color  # atualiza enquanto a câmera vai respondendo
         self.color_check_count += 1
 
         if self.color_check_count >= self.COLOR_CHECK_CYCLES:
