@@ -19,19 +19,17 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': True,
+                # Match robotica-main color_detector_node pipeline (strict_count_gates:=false)
+                'strict_count_gates': False,
+                'min_color_ratio': 0.06,
+                # UFPB depth_camera.urdf.xacro — robotica uses 1.3962634 (80°); set that if you use their URDF
                 'camera_hfov': 1.2,
+                'wall_dedupe_dist': 2.0,
+                'wall_dedupe_dist_back': 4.0,
+                'wall_max_proj': 1.925,
                 'publish_debug_image': False,
-                'wall_max_proj': 4.0,
-                'wall_dedupe_dist': 2.4,
-                'wall_dedupe_dist_back': 5.5,
-                'stable_color_frames': 4,
-                'color_min_area_fraction': 0.065,
-                'max_wall_distance_to_count': 1.65,
-                'centroid_max_abs': 0.32,
-                'max_lidar_bearing_deg': 20.0,
-                'max_front_range_for_count': 2.05,
-                'front_window_deg': 14.0,
-                'max_range_vs_front_disagree': 0.75,
+                # If counts duplicate on same wall from both faces, raise wall_dedupe_dist_back (e.g. 5.0–5.5)
+                # If false positives when passing walls, set strict_count_gates:=true and tune strict params
             }],
         ),
     ])
