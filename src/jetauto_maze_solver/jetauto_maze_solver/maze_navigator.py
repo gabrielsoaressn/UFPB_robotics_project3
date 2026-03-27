@@ -73,7 +73,6 @@ class MazeNavigator(Node):
 
     # ── Limiares de distância (metros) ─────────────────────────────
     FRONT_BLOCKED = 0.7     # frente bloqueada → inicia COLOR_CHECK (antecipado)
-    SIDE_BLOCKED  = 0.6     # lateral bloqueada para detecção de beco sem saída
     WALL_DETECT   = 1.2     # considera parede presente se < este valor
     TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
 
@@ -103,37 +102,21 @@ class MazeNavigator(Node):
 
     # ── COLOR_CHECK ─────────────────────────────────────────────────
     # Número de ciclos (10 Hz) em que o robô fica parado amostrado a cor
-    # antes de decidir a direção do giro. 10 ciclos = 1.0 s.
-    COLOR_CHECK_CYCLES = 10
-
-    # ── Memória de cor durante aproximação ──────────────────────────
-    # Ao se aproximar de uma parede (front_dist < SLOW_DIST), a cor
-    # detectada é acumulada em approach_color_samples. Isso garante que,
-    # mesmo que a câmera perca a cor ao parar (segmento pequeno ou ângulo),
-    # o COLOR_CHECK ainda tem acesso à cor vista durante a aproximação.
-    APPROACH_MEMORY_SECS = 3.0   # janela de tempo para considerar cor "recente"
-
-    # ── ALIGN (realinhamento pós-giro com paredes do LiDAR) ──────────
-    # Após o giro de ~90° por odometria, o robô avança devagar enquanto
-    # aplica _heading_correction() até o erro angular ser estável e pequeno.
-    # Isso elimina o drift acumulado usando a geometria real das paredes.
-    ALIGN_DONE_THRESH  = 0.015   # rad — correção considerada "zero" (~0.9°)
-    ALIGN_DONE_CYCLES  = 6       # ciclos consecutivos abaixo do limiar para sair
-    ALIGN_TIMEOUT      = 40      # ciclos máximos (4 s) antes de desistir
-    ALIGN_FWD_SPEED    = 0.06    # m/s — velocidade de avanço durante alinhamento
+    # antes de decidir a direção do giro. 5 ciclos = 0.5 s.
+    COLOR_CHECK_CYCLES = 5
 
     # ── Anti-backtracking (células visitadas) ───────────────────────
     CELL_SIZE       = 0.4   # tamanho da célula do grid (metros)
     BACKTRACK_DISTS = (1.0, 1.5, 2.0)  # distâncias de projeção para avaliação
 
     # ── Câmera — faixas HSV ─────────────────────────────────────────
-    COLOR_MIN_AREA_FRAC = 0.01   # 1% da imagem completa — sensível a segmentos pequenos
-    RED_LOWER1  = np.array([0,   40,  40])
-    RED_UPPER1  = np.array([15,  255, 255])
-    RED_LOWER2  = np.array([160, 40,  40])
+    COLOR_MIN_AREA_FRAC = 0.05
+    RED_LOWER1  = np.array([0,   80,  50])
+    RED_UPPER1  = np.array([10,  255, 255])
+    RED_LOWER2  = np.array([170, 80,  50])
     RED_UPPER2  = np.array([180, 255, 255])
-    GREEN_LOWER = np.array([35,  40,  40])
-    GREEN_UPPER = np.array([90,  255, 255])
+    GREEN_LOWER = np.array([40,  80,  50])
+    GREEN_UPPER = np.array([85,  255, 255])
 
     def __init__(self):
         super().__init__('maze_navigator')
@@ -150,8 +133,6 @@ class MazeNavigator(Node):
         self.front_dist = self.RANGE_CAP
         self.left_dist  = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
-        self.left_max   = self.RANGE_CAP   # maior leitura no setor esquerdo
-        self.right_max  = self.RANGE_CAP   # maior leitura no setor direito
         self.r_side = self.RANGE_CAP
         self.r_diag = self.RANGE_CAP
         self.l_side = self.RANGE_CAP
@@ -165,9 +146,7 @@ class MazeNavigator(Node):
         self.odom_ready = False
 
         # ── Câmera ──
-        self.detected_color  = None   # cor atual neste frame
-        self.recent_color    = None   # última cor não-nula detectada
-        self.recent_color_ts = None   # timestamp da última detecção não-nula
+        self.detected_color = None   # 'vermelho', 'verde' ou None
 
         # ── Controle lateral suavizado ──
         self.lat_cmd = 0.0   # valor filtrado por EMA
@@ -181,8 +160,6 @@ class MazeNavigator(Node):
         self.turn_direction  = 0.0   # +1 = esquerda, -1 = direita
         self.color_check_count   = 0
         self.color_check_samples = []
-        self.align_stable_count  = 0   # ciclos consecutivos com erro pequeno
-        self.align_total_count   = 0   # ciclos totais no estado ALIGN
         self.loop_count = 0
 
         self.get_logger().info(
@@ -218,15 +195,6 @@ class MazeNavigator(Node):
                     best = min(best, min(r, self.RANGE_CAP))
             return best
 
-        def sector_max(lo, hi):
-            """Retorna a MAIOR leitura válida no setor — detecta aberturas."""
-            worst = 0.0
-            for i in range(min(idx(lo), idx(hi)), max(idx(lo), idx(hi)) + 1):
-                r = ranges[i]
-                if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
-                    worst = max(worst, min(r, self.RANGE_CAP))
-            return worst
-
         def ray_at(a):
             r = ranges[idx(a)]
             if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
@@ -236,9 +204,6 @@ class MazeNavigator(Node):
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.left_dist  = sector_min(self.LEFT_LO,  self.LEFT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
-        # Máximo lateral: se algum raio vê longe, existe uma abertura → não é beco
-        self.left_max  = sector_max(self.LEFT_LO,  self.LEFT_HI)
-        self.right_max = sector_max(self.RIGHT_LO, self.RIGHT_HI)
         self.r_side = ray_at(self.R_SIDE_ANGLE)
         self.r_diag = ray_at(self.R_DIAG_ANGLE)
         self.l_side = ray_at(self.L_SIDE_ANGLE)
@@ -246,10 +211,7 @@ class MazeNavigator(Node):
         self.scan_ready = True
 
     def _image_cb(self, msg: Image):
-        """
-        Detecta cor dominante (vermelho/verde) no frame completo da câmera.
-        Persiste a última cor válida em recent_color por APPROACH_MEMORY_SECS.
-        """
+        """Detecta cor dominante (vermelho/verde) no frame atual da câmera."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
@@ -273,11 +235,6 @@ class MazeNavigator(Node):
             self.detected_color = 'verde'
         else:
             self.detected_color = None
-
-        # Persiste a última cor válida com timestamp
-        if self.detected_color is not None:
-            self.recent_color    = self.detected_color
-            self.recent_color_ts = self.get_clock().now()
 
     # ══════════════════════════════════════════════════════════════════
     # Cálculos de controle
@@ -304,37 +261,15 @@ class MazeNavigator(Node):
         Decide a direção do giro.
 
         Prioridade:
-          0. Beco sem saída (frente + esq + dir bloqueadas) → U-turn 180°
           1. VERMELHO → esquerda (+90°)
           2. VERDE    → direita  (-90°)
           3. Sem cor  → direção com menor score de células visitadas
                         (anti-backtracking). Empate: esquerda.
         """
-        # ── Beco sem saída: nenhuma abertura lateral ──
-        # Usa sector_max: se qualquer raio lateral enxerga longe (> SIDE_BLOCKED),
-        # existe um corredor aberto → NÃO é beco. Só faz U-turn se nenhum
-        # lado tem abertura, i.e., o máximo de ambos os setores é pequeno.
-        if (self.left_max <= self.SIDE_BLOCKED
-                and self.right_max <= self.SIDE_BLOCKED):
-            target = normalize_angle(self.current_yaw + math.pi)
-            return target, 1.0, 'U-turn 180° (beco sem saída)'
-
-        # Se o COLOR_CHECK amostrou None mas a câmera viu uma cor durante a
-        # aproximação (dentro de APPROACH_MEMORY_SECS), usa essa memória.
-        effective_color = color_decision
-        if effective_color is None and self.recent_color is not None:
-            if self.recent_color_ts is not None:
-                elapsed = (self.get_clock().now() - self.recent_color_ts).nanoseconds / 1e9
-                if elapsed <= self.APPROACH_MEMORY_SECS:
-                    effective_color = self.recent_color
-                    self.get_logger().info(
-                        f'[NAV] Usando cor da memória de aproximação: '
-                        f'{effective_color} (há {elapsed:.1f}s)')
-
-        if effective_color == 'vermelho':
+        if color_decision == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
             return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif effective_color == 'verde':
+        elif color_decision == 'verde':
             target = normalize_angle(self.current_yaw - math.pi / 2.0)
             return target, -1.0, 'direita (parede VERDE)'
         else:
@@ -416,8 +351,6 @@ class MazeNavigator(Node):
             self._state_color_check(twist)
         elif self.state == 'TURNING':
             self._state_turning(twist)
-        elif self.state == 'ALIGN':
-            self._state_align(twist)
         else:
             self._state_follow_corridor(twist)
 
@@ -508,9 +441,6 @@ class MazeNavigator(Node):
 
         self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
         self.state = 'TURNING'
-        # Limpa memória de cor para não influenciar o próximo cruzamento
-        self.recent_color    = None
-        self.recent_color_ts = None
         self.get_logger().info(
             f'[NAV] COLOR_CHECK → TURNING {desc}  '
             f'amostras={dict(counts)}  '
@@ -525,12 +455,14 @@ class MazeNavigator(Node):
         error = normalize_angle(self.target_yaw - self.current_yaw)
 
         if abs(error) < self.YAW_TOLERANCE:
-            self.lat_cmd = 0.0
+            self.lat_cmd = 0.0  # zera suavização ao sair do giro
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
             twist.angular.z = 0.0
 
             # Verificação pós-giro: frente ainda bloqueada?
+            # Pode indicar beco sem saída (precisa de +90°) ou drift acumulado.
+            # Volta ao COLOR_CHECK para reavaliar em vez de travar.
             if self.front_dist <= self.FRONT_BLOCKED:
                 self.state = 'COLOR_CHECK'
                 self.color_check_count   = 0
@@ -539,13 +471,11 @@ class MazeNavigator(Node):
                     f'[NAV] TURNING concluído mas frente ainda bloqueada '
                     f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
             else:
-                # Giro concluído → ALIGN para corrigir drift com as paredes reais
-                self.state = 'ALIGN'
-                self.align_stable_count = 0
-                self.align_total_count  = 0
+                self.state = 'FOLLOW_CORRIDOR'
                 self.get_logger().info(
-                    f'[NAV] TURNING concluído → ALIGN  '
-                    f'yaw={math.degrees(self.current_yaw):.1f}°')
+                    f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}°  '
+                    f'erro_final={math.degrees(error):.1f}°')
         else:
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
@@ -556,77 +486,6 @@ class MazeNavigator(Node):
                     f'az={twist.angular.z:+.2f}  '
                     f'yaw={math.degrees(self.current_yaw):.1f}°  '
                     f'target={math.degrees(self.target_yaw):.1f}°')
-
-    # ──────────────────────────────────────────────────────────────────
-    # ESTADO: ALIGN (Realinhamento pós-giro com paredes do LiDAR)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _state_align(self, twist: Twist):
-        """
-        Após o giro de ~90° por odometria, avança devagar aplicando a
-        correção de heading baseada nas paredes reais do LiDAR.
-
-        Saída normal: correção angular cai abaixo de ALIGN_DONE_THRESH
-        por ALIGN_DONE_CYCLES ciclos consecutivos → o robô está paralelo
-        ao corredor e o drift acumulado foi eliminado.
-
-        Saída por timeout: se não alinhar em ALIGN_TIMEOUT ciclos (4 s),
-        segue mesmo assim para não travar.
-
-        Segurança: se a frente bloquear durante o avanço, vai para COLOR_CHECK.
-        """
-        self.align_total_count += 1
-
-        # Segurança: parede na frente durante alinhamento
-        if self.front_dist <= self.FRONT_BLOCKED:
-            self.state = 'COLOR_CHECK'
-            self.color_check_count   = 0
-            self.color_check_samples = []
-            self.lat_cmd = 0.0
-            self.get_logger().info(
-                f'[NAV] ALIGN interrompido (frente bloqueada F={self.front_dist:.2f}m)'
-                f' → COLOR_CHECK')
-            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            return
-
-        az = self._heading_correction()
-
-        # Conta ciclos consecutivos com correção pequena
-        if abs(az) < self.ALIGN_DONE_THRESH:
-            self.align_stable_count += 1
-        else:
-            self.align_stable_count = 0   # reinicia contagem se erro subiu
-
-        # Saída: estável por N ciclos consecutivos
-        if self.align_stable_count >= self.ALIGN_DONE_CYCLES:
-            self.state = 'FOLLOW_CORRIDOR'
-            self.lat_cmd = 0.0
-            self.get_logger().info(
-                f'[NAV] ALIGN concluído → FOLLOW_CORRIDOR  '
-                f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                f'ciclos={self.align_total_count}')
-            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            return
-
-        # Saída por timeout
-        if self.align_total_count >= self.ALIGN_TIMEOUT:
-            self.state = 'FOLLOW_CORRIDOR'
-            self.lat_cmd = 0.0
-            self.get_logger().warn(
-                f'[NAV] ALIGN timeout ({self.ALIGN_TIMEOUT} ciclos) → FOLLOW_CORRIDOR')
-            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            return
-
-        # Avança devagar enquanto corrige o heading
-        twist.linear.x  = self.ALIGN_FWD_SPEED
-        twist.linear.y  = 0.0   # sem correção lateral durante alinhamento
-        twist.angular.z = az
-
-        if self.loop_count % 5 == 0:
-            self.get_logger().info(
-                f'[NAV] ALIGN  az={az:+.4f}  '
-                f'estável={self.align_stable_count}/{self.ALIGN_DONE_CYCLES}  '
-                f'ciclos={self.align_total_count}/{self.ALIGN_TIMEOUT}')
 
     # ──────────────────────────────────────────────────────────────────
     # Cleanup
