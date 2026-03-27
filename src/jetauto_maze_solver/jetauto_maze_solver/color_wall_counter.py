@@ -3,11 +3,11 @@
 Sistema de Visao — Deteccao e Contagem de Paredes Coloridas (Isolado e Passivo)
 
 Detecta paredes Azuis, Verdes e Vermelhas usando camera RGB.
-Usa posicao e orientacao do robo (odometria) para estimar a posicao real da parede no mundo:
-  - Cooldown temporal de 5s por cor (evita re-deteccao imediata)
-  - Deduplicacao por posicao estimada da parede: dist_aprox = MIN_DET_DIST * sqrt(MIN_AREA / area)
-    projetada na direcao do yaw do robo — frente e verso da mesma parede produzem
-    estimativas proximas e sao automaticamente bloqueadas pelo WALL_CLUSTER_DIST
+So detecta uma parede quando:
+  1. A regiao colorida ocupa >= MIN_AREA_FRACTION da imagem (robo esta proximo)
+  2. O centroide da regiao esta no centro horizontal +/- CENTER_TOL (parede na frente do robo)
+Deduplicacao por posicao estimada da parede no mundo (yaw + distancia proporcional a area):
+  frente e verso produzem estimativas convergentes, bloqueadas pelo WALL_CLUSTER_DIST
 
 *** Este no NUNCA publica comandos de velocidade. ***
 
@@ -28,12 +28,16 @@ from datetime import datetime
 
 class ColorWallCounter(Node):
 
-    MIN_AREA_FRACTION = 0.06
+    # Fracao minima da imagem que a parede deve ocupar (robo proximo)
+    MIN_AREA_FRACTION = 0.15
     COOLDOWN_SECS = 5.0
+    # Tolerancia horizontal: centroide da cor deve estar no centro +/- (CENTER_TOL * largura)
+    # 0.25 = aceita somente no quarto central da imagem (parede na frente do robo)
+    CENTER_TOL = 0.25
     # Distancia estimada (m) ate a parede quando area_fraction == MIN_AREA_FRACTION
-    MIN_DET_DIST = 2.0
+    MIN_DET_DIST = 1.5
     # Distancia maxima (m) entre estimativas de posicao para ser considerada a mesma parede
-    WALL_CLUSTER_DIST = 1.0
+    WALL_CLUSTER_DIST = 1.2
 
     COLOR_RANGES = {
         'azul': [
@@ -84,6 +88,7 @@ class ColorWallCounter(Node):
         self.get_logger().info(
             f'[VISAO] Cooldown: {self.COOLDOWN_SECS}s  '
             f'Area minima: {self.MIN_AREA_FRACTION * 100:.0f}%  '
+            f'Centro +/-{self.CENTER_TOL * 100:.0f}%  '
             f'Dist deteccao: {self.MIN_DET_DIST}m  '
             f'Cluster parede: {self.WALL_CLUSTER_DIST}m')
 
@@ -126,6 +131,14 @@ class ColorWallCounter(Node):
             largest = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest)
             if area < min_area:
+                continue
+
+            # Verificar se a parede esta na frente do robo (centroide horizontalmente centrado)
+            M = cv2.moments(largest)
+            if M['m00'] == 0:
+                continue
+            cx = M['m10'] / M['m00']
+            if abs(cx - w / 2.0) > self.CENTER_TOL * w:
                 continue
 
             # Estimar posicao da parede no mundo:
