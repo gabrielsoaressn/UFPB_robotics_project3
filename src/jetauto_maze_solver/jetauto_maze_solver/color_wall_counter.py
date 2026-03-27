@@ -3,10 +3,11 @@
 Sistema de Visao — Deteccao e Contagem de Paredes Coloridas (Isolado e Passivo)
 
 Detecta paredes Azuis, Verdes e Vermelhas usando camera RGB.
-Usa posicao do robo (odometria) para evitar contar a mesma parede duas vezes:
+Usa posicao e orientacao do robo (odometria) para evitar contar a mesma parede duas vezes:
   - Cooldown temporal de 5s por cor (mesma parede enquanto passa)
-  - Deduplicacao espacial: so conta se estiver >2m de todas as deteccoes
-    anteriores daquela cor
+  - Deduplicacao espacial: so conta se estiver >3m de deteccoes anteriores da mesma cor
+  - Deduplicacao de verso: bloqueia se estiver <4m e ~180° virado em relacao a deteccao anterior
+    (frente e verso da mesma parede contados como uma so)
 
 *** Este no NUNCA publica comandos de velocidade. ***
 
@@ -27,9 +28,11 @@ from datetime import datetime
 
 class ColorWallCounter(Node):
 
-    MIN_AREA_FRACTION = 0.03
+    MIN_AREA_FRACTION = 0.06
     COOLDOWN_SECS = 5.0
-    MIN_DISTANCE = 2.0  # metros — distancia minima entre deteccoes da mesma cor
+    MIN_DISTANCE = 3.0   # metros — distancia minima entre deteccoes da mesma cor
+    BACK_WALL_DISTANCE = 4.0   # metros — raio para detectar verso da mesma parede
+    BACK_WALL_ANGLE = 2.5      # radianos (~143°) — angulo minimo para considerar verso
 
     COLOR_RANGES = {
         'azul': [
@@ -72,6 +75,7 @@ class ColorWallCounter(Node):
         # Posicao atual do robo
         self.robot_x = 0.0
         self.robot_y = 0.0
+        self.robot_yaw = 0.0
         self.odom_ready = False
 
         self.get_logger().info(
@@ -84,6 +88,11 @@ class ColorWallCounter(Node):
     def _odom_cb(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        self.robot_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
         self.odom_ready = True
 
     def _image_cb(self, msg: Image):
@@ -128,7 +137,8 @@ class ColorWallCounter(Node):
             # Nova parede detectada!
             self.counts[color] += 1
             self.last_detection_time[color] = now
-            self.detection_positions[color].append((self.robot_x, self.robot_y))
+            self.detection_positions[color].append(
+                (self.robot_x, self.robot_y, self.robot_yaw))
 
             placar = self._format_placar()
             self.get_logger().info(
@@ -144,11 +154,23 @@ class ColorWallCounter(Node):
         return elapsed >= self.COOLDOWN_SECS
 
     def _position_ok(self, color: str) -> bool:
-        """Retorna True se a posicao atual esta longe de todas as deteccoes anteriores."""
-        for px, py in self.detection_positions[color]:
+        """Retorna True se a posicao atual nao e duplicata de deteccoes anteriores.
+
+        Bloqueia se:
+          - distancia < MIN_DISTANCE (mesma face da parede), OU
+          - distancia < BACK_WALL_DISTANCE E angulo ~180° (verso da mesma parede).
+        """
+        for px, py, pyaw in self.detection_positions[color]:
             dist = math.sqrt((self.robot_x - px) ** 2 + (self.robot_y - py) ** 2)
             if dist < self.MIN_DISTANCE:
                 return False
+            if dist < self.BACK_WALL_DISTANCE:
+                angle_diff = abs(math.atan2(
+                    math.sin(self.robot_yaw - pyaw),
+                    math.cos(self.robot_yaw - pyaw)
+                ))
+                if angle_diff > self.BACK_WALL_ANGLE:
+                    return False
         return True
 
     def _format_placar(self) -> str:
@@ -172,8 +194,8 @@ class ColorWallCounter(Node):
         ]
         for color in self.COLOR_RANGES:
             lines.append(f'  {color.capitalize():10s}: {self.counts[color]}')
-            for i, (px, py) in enumerate(self.detection_positions[color], 1):
-                lines.append(f'    #{i} em ({px:.1f}, {py:.1f})')
+            for i, (px, py, pyaw) in enumerate(self.detection_positions[color], 1):
+                lines.append(f'    #{i} em ({px:.1f}, {py:.1f}) yaw={math.degrees(pyaw):.0f}°')
         lines += [
             '',
             f'Total de paredes detectadas: {total}',
