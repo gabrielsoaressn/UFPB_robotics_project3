@@ -103,8 +103,15 @@ class MazeNavigator(Node):
 
     # ── COLOR_CHECK ─────────────────────────────────────────────────
     # Número de ciclos (10 Hz) em que o robô fica parado amostrado a cor
-    # antes de decidir a direção do giro. 5 ciclos = 0.5 s.
-    COLOR_CHECK_CYCLES = 5
+    # antes de decidir a direção do giro. 10 ciclos = 1.0 s.
+    COLOR_CHECK_CYCLES = 10
+
+    # ── Memória de cor durante aproximação ──────────────────────────
+    # Ao se aproximar de uma parede (front_dist < SLOW_DIST), a cor
+    # detectada é acumulada em approach_color_samples. Isso garante que,
+    # mesmo que a câmera perca a cor ao parar (segmento pequeno ou ângulo),
+    # o COLOR_CHECK ainda tem acesso à cor vista durante a aproximação.
+    APPROACH_MEMORY_SECS = 3.0   # janela de tempo para considerar cor "recente"
 
     # ── ALIGN (realinhamento pós-giro com paredes do LiDAR) ──────────
     # Após o giro de ~90° por odometria, o robô avança devagar enquanto
@@ -120,7 +127,10 @@ class MazeNavigator(Node):
     BACKTRACK_DISTS = (1.0, 1.5, 2.0)  # distâncias de projeção para avaliação
 
     # ── Câmera — faixas HSV ─────────────────────────────────────────
-    COLOR_MIN_AREA_FRAC = 0.05
+    # Limiar aplicado apenas à faixa central da imagem (40% central em largura),
+    # onde uma parede frontal aparece. Reduz falsos positivos de paredes laterais.
+    COLOR_MIN_AREA_FRAC = 0.02   # 2% da região central — mais sensível que 5% global
+    COLOR_CENTER_FRAC   = 0.40   # analisa os 40% centrais da largura da imagem
     RED_LOWER1  = np.array([0,   80,  50])
     RED_UPPER1  = np.array([10,  255, 255])
     RED_LOWER2  = np.array([170, 80,  50])
@@ -156,7 +166,9 @@ class MazeNavigator(Node):
         self.odom_ready = False
 
         # ── Câmera ──
-        self.detected_color = None   # 'vermelho', 'verde' ou None
+        self.detected_color  = None   # cor atual neste frame
+        self.recent_color    = None   # última cor não-nula detectada
+        self.recent_color_ts = None   # timestamp da última detecção não-nula
 
         # ── Controle lateral suavizado ──
         self.lat_cmd = 0.0   # valor filtrado por EMA
@@ -223,16 +235,28 @@ class MazeNavigator(Node):
         self.scan_ready = True
 
     def _image_cb(self, msg: Image):
-        """Detecta cor dominante (vermelho/verde) no frame atual da câmera."""
+        """
+        Detecta cor dominante (vermelho/verde) na região central da câmera.
+
+        Analisa apenas os COLOR_CENTER_FRAC centrais da largura (onde uma parede
+        frontal aparece), reduzindo falsos positivos de paredes laterais.
+        Quando detecta uma cor, persiste em recent_color por APPROACH_MEMORY_SECS
+        para ser usada mesmo que o frame seguinte perca a cor.
+        """
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f'[NAV] cv_bridge: {e}')
             return
 
-        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        h, w = hsv.shape[:2]
-        min_area = self.COLOR_MIN_AREA_FRAC * h * w
+        _, w = cv_image.shape[:2]
+        # Recorta a faixa central horizontal
+        margin = int(w * (1.0 - self.COLOR_CENTER_FRAC) / 2.0)
+        roi = cv_image[:, margin: w - margin]
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        rh, rw = hsv.shape[:2]
+        min_area = self.COLOR_MIN_AREA_FRAC * rh * rw
 
         mask_r = cv2.bitwise_or(
             cv2.inRange(hsv, self.RED_LOWER1, self.RED_UPPER1),
@@ -247,6 +271,11 @@ class MazeNavigator(Node):
             self.detected_color = 'verde'
         else:
             self.detected_color = None
+
+        # Persiste a última cor válida com timestamp
+        if self.detected_color is not None:
+            self.recent_color    = self.detected_color
+            self.recent_color_ts = self.get_clock().now()
 
     # ══════════════════════════════════════════════════════════════════
     # Cálculos de controle
@@ -285,10 +314,22 @@ class MazeNavigator(Node):
             target = normalize_angle(self.current_yaw + math.pi)
             return target, 1.0, 'U-turn 180° (beco sem saída)'
 
-        if color_decision == 'vermelho':
+        # Se o COLOR_CHECK amostrou None mas a câmera viu uma cor durante a
+        # aproximação (dentro de APPROACH_MEMORY_SECS), usa essa memória.
+        effective_color = color_decision
+        if effective_color is None and self.recent_color is not None:
+            if self.recent_color_ts is not None:
+                elapsed = (self.get_clock().now() - self.recent_color_ts).nanoseconds / 1e9
+                if elapsed <= self.APPROACH_MEMORY_SECS:
+                    effective_color = self.recent_color
+                    self.get_logger().info(
+                        f'[NAV] Usando cor da memória de aproximação: '
+                        f'{effective_color} (há {elapsed:.1f}s)')
+
+        if effective_color == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
             return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif color_decision == 'verde':
+        elif effective_color == 'verde':
             target = normalize_angle(self.current_yaw - math.pi / 2.0)
             return target, -1.0, 'direita (parede VERDE)'
         else:
@@ -462,6 +503,9 @@ class MazeNavigator(Node):
 
         self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
         self.state = 'TURNING'
+        # Limpa memória de cor para não influenciar o próximo cruzamento
+        self.recent_color    = None
+        self.recent_color_ts = None
         self.get_logger().info(
             f'[NAV] COLOR_CHECK → TURNING {desc}  '
             f'amostras={dict(counts)}  '
