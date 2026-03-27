@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
-Sistema de Visao — Deteccao e Contagem de Paredes Coloridas (Isolado e Passivo)
-
-Detecta paredes Azuis, Verdes e Vermelhas usando camera RGB.
-Usa posicao do robo (odometria) para evitar contar a mesma parede duas vezes:
-  - Cooldown temporal de 5s por cor (mesma parede enquanto passa)
-  - Deduplicacao espacial: so conta se estiver >2m de todas as deteccoes
-    anteriores daquela cor
-
-*** Este no NUNCA publica comandos de velocidade. ***
-
-Topicos assinados: /camera/image_raw, /odometry/filtered
+Sistema de Visão — Detecção e Contagem de Paredes Coloridas
+Solução Equilibrada: Conta em movimento a direito, ignora em curva.
 """
 
 import math
@@ -24,149 +15,140 @@ import numpy as np
 import os
 from datetime import datetime
 
-
 class ColorWallCounter(Node):
 
-    MIN_AREA_FRACTION = 0.35
-    COOLDOWN_SECS = 5.0
-    MIN_DISTANCE = 2.5  # metros — distancia minima entre deteccoes da mesma cor
+    # Reduzido para 10%. Permite contar a parede enquanto o robô se aproxima.
+    MIN_AREA_FRACTION = 0.10
+    COOLDOWN_SECS = 4.0
+    CENTER_TOL = 0.35   # A cor deve estar nos 70% centrais da imagem
+    MIN_DISTANCE = 2.0  # Raio de 2m para fundir a frente e o verso da mesma parede
 
     COLOR_RANGES = {
-        'azul': [
-            (np.array([100, 80, 50]), np.array([130, 255, 255])),
-        ],
-        'verde': [
-            (np.array([40, 80, 50]), np.array([85, 255, 255])),
-        ],
+        'azul': [(np.array([100, 80, 50]), np.array([130, 255, 255]))],
+        'verde': [(np.array([40, 80, 50]), np.array([85, 255, 255]))],
         'vermelho': [
             (np.array([0, 80, 50]),   np.array([10, 255, 255])),
-            (np.array([170, 80, 50]), np.array([180, 255, 255])),
+            (np.array([170, 80, 50]), np.array([180, 255, 255]))
         ],
     }
 
-    COLOR_LABELS = {
-        'azul': 'A',
-        'verde': 'V',
-        'vermelho': 'R',
-    }
+    COLOR_LABELS = {'azul': 'A', 'verde': 'V', 'vermelho': 'R'}
 
     def __init__(self):
         super().__init__('color_wall_counter')
-
         self.bridge = CvBridge()
 
-        self.create_subscription(
-            Image, '/camera/image_raw', self._image_cb, 10)
-        self.create_subscription(
-            Odometry, '/odometry/filtered', self._odom_cb, 10)
+        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
 
-        # Contagens por cor
         self.counts = {color: 0 for color in self.COLOR_RANGES}
-
-        # Cooldown temporal por cor
         self.last_detection_time = {color: None for color in self.COLOR_RANGES}
-
-        # Posicoes (x, y) onde cada cor foi detectada — para deduplicacao espacial
         self.detection_positions = {color: [] for color in self.COLOR_RANGES}
 
-        # Posicao atual do robo
         self.robot_x = 0.0
         self.robot_y = 0.0
+        self.robot_yaw = 0.0
+        self.angular_z = 0.0
         self.odom_ready = False
+        
+        self.last_frame_time = self.get_clock().now()
 
-        self.get_logger().info(
-            '[VISAO] Sistema de Visao iniciado — detectando paredes coloridas')
-        self.get_logger().info(
-            f'[VISAO] Cooldown: {self.COOLDOWN_SECS}s  '
-            f'Area minima: {self.MIN_AREA_FRACTION * 100:.0f}%  '
-            f'Dist minima: {self.MIN_DISTANCE}m')
+        self.get_logger().info('[VISÃO] Visão Equilibrada Iniciada (Permite contagem em aproximação)')
 
     def _odom_cb(self, msg: Odometry):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        self.robot_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        )
+        # Lê apenas a velocidade de rotação
+        self.angular_z = msg.twist.twist.angular.z
         self.odom_ready = True
 
     def _image_cb(self, msg: Image):
         if not self.odom_ready:
             return
 
+        now = self.get_clock().now()
+        
+        # Limita a 5 FPS para não sobrecarregar
+        if (now - self.last_frame_time).nanoseconds / 1e9 < 0.2:
+            return
+        self.last_frame_time = now
+
+        # ── REGRA RELAXADA: APENAS NÃO ESTAR A RODAR ──
+        # Se a velocidade angular for maior que 0.15, o robô está a fazer uma curva.
+        # Se for menor, ele está a ir a direito para a parede (ou parado).
+        if abs(self.angular_z) > 0.15:
+            return
+        # ──────────────────────────────────────────────
+
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f'[VISAO] Erro cv_bridge: {e}')
+        except Exception:
             return
 
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
         min_area = self.MIN_AREA_FRACTION * h * w
 
-        now = self.get_clock().now()
-
         for color, ranges in self.COLOR_RANGES.items():
             mask = np.zeros((h, w), dtype=np.uint8)
             for lower, upper in ranges:
                 mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
 
-            contours, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not contours:
                 continue
 
             largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            if area < min_area:
+            if cv2.contourArea(largest) < min_area:
                 continue
 
-            # 3. Trava de Centro: Garante que a parede está na FRENTE do robô, e não de lado.
             M = cv2.moments(largest)
-            if M['m00'] == 0:
-                continue
+            if M['m00'] == 0: continue
             cx = M['m10'] / M['m00']
-            # Se o centro da cor estiver fora dos 40% centrais da imagem, ignora.
-            if abs(cx - w / 2.0) > 0.20 * w:
+            
+            # A cor deve estar nos 70% centrais do ecrã
+            if abs(cx - w / 2.0) > self.CENTER_TOL * w:
                 continue
 
-            # Cooldown temporal
+            # ── PROJECÇÃO FIXA DA PAREDE ──
+            # O robô regista a parede 0.8 metros à sua frente.
+            wall_x = self.robot_x + 0.8 * math.cos(self.robot_yaw)
+            wall_y = self.robot_y + 0.8 * math.sin(self.robot_yaw)
+            # ──────────────────────────────
+
             if not self._cooldown_ok(color, now):
                 continue
 
-            # Deduplicacao espacial — so conta se longe de deteccoes anteriores
-            if not self._position_ok(color):
+            if not self._position_ok(color, wall_x, wall_y):
                 continue
 
-            # Nova parede detectada!
             self.counts[color] += 1
             self.last_detection_time[color] = now
-            self.detection_positions[color].append((self.robot_x, self.robot_y))
+            self.detection_positions[color].append((wall_x, wall_y))
 
-            placar = self._format_placar()
             self.get_logger().info(
-                f'[VISAO] Parede {color.upper()} detectada em '
-                f'({self.robot_x:.1f}, {self.robot_y:.1f})! '
-                f'Placar: {placar}')
+                f'[VISÃO] Parede {color.upper()} -> Robô:({self.robot_x:.1f}, {self.robot_y:.1f}) | '
+                f'Parede:({wall_x:.1f}, {wall_y:.1f}) | Placar: {self._format_placar()}')
 
     def _cooldown_ok(self, color: str, now) -> bool:
         last = self.last_detection_time[color]
-        if last is None:
-            return True
-        elapsed = (now - last).nanoseconds / 1e9
-        return elapsed >= self.COOLDOWN_SECS
+        if last is None: return True
+        return (now - last).nanoseconds / 1e9 >= self.COOLDOWN_SECS
 
-    def _position_ok(self, color: str) -> bool:
-        """Retorna True se a posicao atual esta longe de todas as deteccoes anteriores."""
-        for px, py in self.detection_positions[color]:
-            dist = math.sqrt((self.robot_x - px) ** 2 + (self.robot_y - py) ** 2)
+    def _position_ok(self, color: str, wall_x: float, wall_y: float) -> bool:
+        for wx, wy in self.detection_positions[color]:
+            dist = math.sqrt((wall_x - wx) ** 2 + (wall_y - wy) ** 2)
             if dist < self.MIN_DISTANCE:
                 return False
         return True
 
     def _format_placar(self) -> str:
-        parts = []
-        for color in self.COLOR_RANGES:
-            label = self.COLOR_LABELS[color]
-            count = self.counts[color]
-            parts.append(f'{label}:{count}')
-        return ', '.join(parts)
+        return ', '.join([f"{self.COLOR_LABELS[c]}:{self.counts[c]}" for c in self.COLOR_RANGES])
 
     def _save_report(self):
         report_path = os.path.join(os.getcwd(), 'color_wall_report.txt')
@@ -174,41 +156,30 @@ class ColorWallCounter(Node):
         total = sum(self.counts.values())
 
         lines = [
-            '=== Relatorio de Paredes Coloridas ===',
+            '=== Relatório de Paredes Coloridas ===',
             f'Data/hora: {timestamp}',
             '',
             'Contagem por cor:',
         ]
         for color in self.COLOR_RANGES:
             lines.append(f'  {color.capitalize():10s}: {self.counts[color]}')
-            for i, (px, py) in enumerate(self.detection_positions[color], 1):
-                lines.append(f'    #{i} em ({px:.1f}, {py:.1f})')
-        lines += [
-            '',
-            f'Total de paredes detectadas: {total}',
-        ]
+            for i, (wx, wy) in enumerate(self.detection_positions[color], 1):
+                lines.append(f'    #{i} estimada em ({wx:.1f}, {wy:.1f})')
+        lines += ['', f'Total de paredes detectadas: {total}']
 
-        with open(report_path, 'w') as f:
-            f.write('\n'.join(lines) + '\n')
-
-        self.get_logger().info(f'[VISAO] Relatorio salvo em {report_path}')
-
+        with open(report_path, 'w') as f: f.write('\n'.join(lines) + '\n')
+        self.get_logger().info(f'[VISÃO] Relatório salvo em {report_path}')
 
 def main(args=None):
     rclpy.init(args=args)
     node = ColorWallCounter()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
     finally:
         node._save_report()
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
-
+        try: rclpy.shutdown()
+        except: pass
 
 if __name__ == '__main__':
     main()
