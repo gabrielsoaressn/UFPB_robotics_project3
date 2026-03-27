@@ -262,15 +262,41 @@ class MazeNavigator(Node):
         Decide a direção do giro.
 
         Prioridade:
+          0. Beco sem saída → U-turn 180°
+             Critério A (geométrico): nenhum raio lateral vê além de SIDE_BLOCKED
+             Critério B (contador):   frente bloqueada 2x consecutivas sem sair
           1. VERMELHO → esquerda (+90°)
           2. VERDE    → direita  (-90°)
-          3. Sem cor  → direção com menor score de células visitadas
-                        (anti-backtracking). Empate: esquerda.
+          3. Sem cor  → direção com menor score de células visitadas.
+                        Empate: esquerda.
         """
-        if color_decision == 'vermelho':
+        # ── Beco sem saída ──
+        geo_deadend   = (self.left_max  <= self.SIDE_BLOCKED
+                         and self.right_max <= self.SIDE_BLOCKED)
+        self.consecutive_blocks += 1
+        count_deadend = self.consecutive_blocks >= 2
+
+        if geo_deadend or count_deadend:
+            self.consecutive_blocks = 0
+            target = normalize_angle(self.current_yaw + math.pi)
+            reason = 'geométrico' if geo_deadend else 'bloqueio consecutivo'
+            self.get_logger().warn(f'[NAV] Beco detectado ({reason}) → U-turn')
+            return target, 1.0, f'U-turn 180° ({reason})'
+
+        # ── Cor da câmera ──
+        effective_color = color_decision
+        if effective_color is None and self.recent_color is not None:
+            if self.recent_color_ts is not None:
+                elapsed = (self.get_clock().now() - self.recent_color_ts).nanoseconds / 1e9
+                if elapsed <= self.APPROACH_MEMORY_SECS:
+                    effective_color = self.recent_color
+                    self.get_logger().info(
+                        f'[NAV] Usando cor da memória: {effective_color} ({elapsed:.1f}s atrás)')
+
+        if effective_color == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
             return target, 1.0, 'esquerda (parede VERMELHA)'
-        elif color_decision == 'verde':
+        elif effective_color == 'verde':
             target = normalize_angle(self.current_yaw - math.pi / 2.0)
             return target, -1.0, 'direita (parede VERDE)'
         else:
@@ -472,6 +498,8 @@ class MazeNavigator(Node):
                     f'[NAV] TURNING concluído mas frente ainda bloqueada '
                     f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
             else:
+                # Saiu do bloqueio com sucesso → zera contador de becos
+                self.consecutive_blocks = 0
                 self.state = 'FOLLOW_CORRIDOR'
                 self.get_logger().info(
                     f'[NAV] TURNING concluído → FOLLOW_CORRIDOR  '
