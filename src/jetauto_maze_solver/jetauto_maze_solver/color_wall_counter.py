@@ -10,7 +10,7 @@ Usa posicao do robo (odometria) para evitar contar a mesma parede duas vezes:
 
 *** Este no NUNCA publica comandos de velocidade. ***
 
-Topicos assinados: /camera/image_raw, /odometry/filtered
+Topicos assinados: /jetauto/camera/image_raw, /odometry/filtered
 """
 
 import math
@@ -56,7 +56,7 @@ class ColorWallCounter(Node):
         self.bridge = CvBridge()
 
         self.create_subscription(
-            Image, '/camera/image_raw', self._image_cb, 10)
+            Image, '/jetauto/camera/image_raw', self._image_cb, 10)
         self.create_subscription(
             Odometry, '/odometry/filtered', self._odom_cb, 10)
 
