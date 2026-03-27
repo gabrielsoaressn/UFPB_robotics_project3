@@ -65,7 +65,10 @@ class MazeNavigator(Node):
 
     # Velocidades
     FORWARD_SPEED = 0.15
+    ARC_SPEED     = 0.08     # Velocidade linear durante o arco de curva
     TURN_SPEED    = 0.4
+    TURN_KP       = 2.5      # Ganho proporcional do giro (suaviza a chegada ao alvo)
+    TURN_MIN      = 0.10     # Velocidade mínima para não travar perto do alvo
     YAW_TOLERANCE = 0.05
 
     RANGE_CAP       = 3.0
@@ -283,8 +286,13 @@ class MazeNavigator(Node):
             self.get_logger().info(
                 f'[NAV] Giro finalizado. Erro: {math.degrees(odom_error):.1f}°')
         else:
-            twist.linear.x = twist.linear.y = 0.0
-            twist.angular.z = self.TURN_SPEED * self.turn_direction
+            raw = self.TURN_KP * odom_error
+            clamped = max(-self.TURN_SPEED, min(raw, self.TURN_SPEED))
+            if abs(clamped) < self.TURN_MIN:
+                clamped = math.copysign(self.TURN_MIN, odom_error)
+            twist.angular.z = clamped
+            twist.linear.x = self.ARC_SPEED   # avança durante a curva, fazendo arco
+            twist.linear.y = 0.0
 
     def destroy_node(self):
         self.cmd_pub.publish(Twist())
