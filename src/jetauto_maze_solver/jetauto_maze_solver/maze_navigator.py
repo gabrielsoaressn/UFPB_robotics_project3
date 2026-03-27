@@ -127,16 +127,13 @@ class MazeNavigator(Node):
     BACKTRACK_DISTS = (1.0, 1.5, 2.0)  # distâncias de projeção para avaliação
 
     # ── Câmera — faixas HSV ─────────────────────────────────────────
-    # Limiar aplicado apenas à faixa central da imagem (40% central em largura),
-    # onde uma parede frontal aparece. Reduz falsos positivos de paredes laterais.
-    COLOR_MIN_AREA_FRAC = 0.02   # 2% da região central — mais sensível que 5% global
-    COLOR_CENTER_FRAC   = 0.40   # analisa os 40% centrais da largura da imagem
-    RED_LOWER1  = np.array([0,   80,  50])
-    RED_UPPER1  = np.array([10,  255, 255])
-    RED_LOWER2  = np.array([170, 80,  50])
+    COLOR_MIN_AREA_FRAC = 0.01   # 1% da imagem completa — sensível a segmentos pequenos
+    RED_LOWER1  = np.array([0,   40,  40])
+    RED_UPPER1  = np.array([15,  255, 255])
+    RED_LOWER2  = np.array([160, 40,  40])
     RED_UPPER2  = np.array([180, 255, 255])
-    GREEN_LOWER = np.array([40,  80,  50])
-    GREEN_UPPER = np.array([85,  255, 255])
+    GREEN_LOWER = np.array([35,  40,  40])
+    GREEN_UPPER = np.array([90,  255, 255])
 
     def __init__(self):
         super().__init__('maze_navigator')
@@ -250,12 +247,8 @@ class MazeNavigator(Node):
 
     def _image_cb(self, msg: Image):
         """
-        Detecta cor dominante (vermelho/verde) na região central da câmera.
-
-        Analisa apenas os COLOR_CENTER_FRAC centrais da largura (onde uma parede
-        frontal aparece), reduzindo falsos positivos de paredes laterais.
-        Quando detecta uma cor, persiste em recent_color por APPROACH_MEMORY_SECS
-        para ser usada mesmo que o frame seguinte perca a cor.
+        Detecta cor dominante (vermelho/verde) no frame completo da câmera.
+        Persiste a última cor válida em recent_color por APPROACH_MEMORY_SECS.
         """
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -263,14 +256,9 @@ class MazeNavigator(Node):
             self.get_logger().error(f'[NAV] cv_bridge: {e}')
             return
 
-        _, w = cv_image.shape[:2]
-        # Recorta a faixa central horizontal
-        margin = int(w * (1.0 - self.COLOR_CENTER_FRAC) / 2.0)
-        roi = cv_image[:, margin: w - margin]
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        rh, rw = hsv.shape[:2]
-        min_area = self.COLOR_MIN_AREA_FRAC * rh * rw
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        min_area = self.COLOR_MIN_AREA_FRAC * h * w
 
         mask_r = cv2.bitwise_or(
             cv2.inRange(hsv, self.RED_LOWER1, self.RED_UPPER1),
