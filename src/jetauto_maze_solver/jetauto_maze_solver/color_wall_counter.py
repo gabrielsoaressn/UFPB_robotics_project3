@@ -124,7 +124,7 @@ class ColorWallCounter(Node):
             if not self._cooldown_ok(color, now):
                 continue
 
-            if not self._position_ok(color, wall_x, wall_y):
+            if not self._position_ok(color):
                 continue
 
             self.counts[color] += 1
@@ -139,13 +139,6 @@ class ColorWallCounter(Node):
         last = self.last_detection_time[color]
         if last is None: return True
         return (now - last).nanoseconds / 1e9 >= self.COOLDOWN_SECS
-
-    def _position_ok(self, color: str, wall_x: float, wall_y: float) -> bool:
-        for wx, wy in self.detection_positions[color]:
-            dist = math.sqrt((wall_x - wx) ** 2 + (wall_y - wy) ** 2)
-            if dist < self.MIN_DISTANCE:
-                return False
-        return True
 
     def _position_ok(self, color: str) -> bool:
         """Retorna True se a posicao atual esta longe de todas as deteccoes anteriores."""
