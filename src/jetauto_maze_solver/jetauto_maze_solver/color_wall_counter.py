@@ -38,9 +38,9 @@ def yaw_from_quaternion(q):
 class ColorWallCounter(Node):
 
     # ── Área mínima do contorno (fração da imagem) ─────────────────
-    # A cor deve ocupar pelo menos 3% da imagem para ser considerada
+    # A cor deve ocupar pelo menos 8% da imagem para ser considerada
     # uma parede próxima/frontal (filtra reflexos e objetos distantes).
-    MIN_AREA_FRACTION = 0.03
+    MIN_AREA_FRACTION = 0.08
 
     # ── Deduplicação por posição ───────────────────────────────────
     # Duas detecções da mesma cor a menos de DEDUP_DIST metros
