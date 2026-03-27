@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Colored wall counting for Gazebo + maze_navigator stack (no RViz required).
+Colored wall counting — pipeline aligned with robotica-main color_detector_node.py:
 
-Uses the same camera rules as maze_navigator (camera_color_config): HSV bands,
-minimum area fraction, winner selection. LiDAR + centroid bearing estimates wall
-pose for deduplication (front/back).
+  • HSV + morphological open + min_color_ratio (fraction of image)
+  • Centroid → LiDAR bearing → wall pose
+  • Edge trigger on color (one evaluation pass per continuous visibility, like robotica)
+  • Angle-aware deduplication (same / opposite face)
 
-Extra gating: stable frames, strict max range, centroid + LiDAR bearing (reject
-side glances when passing a wall), front LiDAR must show a nearby obstacle (reject
-long straight corridors), enlarged back-face dedupe radius for same wall.
-
-Optional: publish /jetauto/camera/color_debug for rqt_image_view (off by default).
+Parameter strict_count_gates (default false): when true, applies extra filters
+(stable frames, frontal LiDAR agreement, etc.) from earlier experiments.
 """
 
 from __future__ import annotations
@@ -27,10 +25,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
 
-from jetauto_maze_solver.camera_color_config import (
-    COLOR_MIN_AREA_FRAC,
-    dominant_wall_color_from_bgr,
-)
+from jetauto_maze_solver.robotica_style_color import RGB_TO_PT, detect_dominant_color_robotica
 
 
 def yaw_from_quat(q) -> float:
@@ -61,21 +56,19 @@ _PT_ORDER = ('vermelho', 'verde', 'azul')
 _COLOR_LABELS = {'azul': 'A', 'verde': 'V', 'vermelho': 'R'}
 
 _COLOR_BGR = {
-    'vermelho': (0, 0, 255),
-    'verde': (0, 255, 0),
-    'azul': (255, 0, 0),
+    'RED': (0, 0, 255),
+    'GREEN': (0, 255, 0),
+    'BLUE': (255, 0, 0),
 }
 
 
 class ColorWallCounter(Node):
-    # Same-side duplicate detections (odom noise / wobble)
-    WALL_DEDUPE_DIST = 2.4
-    # Opposite approach to same thin wall — must exceed wall thickness + both projections
-    WALL_DEDUPE_DIST_BACK = 5.5
-    # Cap for LiDAR projection; keep >= longest corridor sightline you expect
-    WALL_MAX_PROJ = 4.0
-    # UFPB depth_camera.urdf.xacro horizontal_fov
-    CAMERA_HFOV = 1.2
+    # Defaults match robotica-main color_detector_node.py
+    WALL_DEDUPE_DIST = 2.0
+    WALL_DEDUPE_DIST_BACK = 3.0
+    WALL_MAX_PROJ = 1.925
+    MIN_COLOR_RATIO = 0.06
+    CAMERA_HFOV = 1.3962634
 
     def __init__(self):
         super().__init__('color_wall_counter')
@@ -87,20 +80,18 @@ class ColorWallCounter(Node):
         self.declare_parameter('wall_dedupe_dist_back', self.WALL_DEDUPE_DIST_BACK)
         self.declare_parameter('wall_max_proj', self.WALL_MAX_PROJ)
         self.declare_parameter('camera_hfov', self.CAMERA_HFOV)
-        self.declare_parameter('color_min_area_fraction', COLOR_MIN_AREA_FRAC)
+        self.declare_parameter('min_color_ratio', self.MIN_COLOR_RATIO)
         self.declare_parameter('publish_debug_image', False)
-        # Require N consecutive camera frames with same dominant color (reduces flicker / false triggers)
+        # Master switch: false = same behaviour family as robotica-main (recommended)
+        self.declare_parameter('strict_count_gates', False)
+
+        # Only used when strict_count_gates is true
         self.declare_parameter('stable_color_frames', 3)
-        # Max range along color bearing to accept a count (stay strict — avoids “far” counts)
         self.declare_parameter('max_wall_distance_to_count', 1.65)
-        # Centroid must stay near image centre (reject corners / walls glimpsed from the side)
         self.declare_parameter('centroid_max_abs', 0.32)
-        # |bearing from colour blob| must be below this (deg); side walls while passing exceed it
         self.declare_parameter('max_lidar_bearing_deg', 20.0)
-        # Min range straight ahead must be <= this (m); open corridor ahead => do not count
         self.declare_parameter('max_front_range_for_count', 2.05)
         self.declare_parameter('front_window_deg', 14.0)
-        # Optional: |dist(bearing) - dist(straight ahead)| must be <= this (m) when counting
         self.declare_parameter('max_range_vs_front_disagree', 0.75)
 
         img_topic = self.get_parameter('image_topic').get_parameter_value().string_value
@@ -110,8 +101,9 @@ class ColorWallCounter(Node):
         self.WALL_DEDUPE_DIST_BACK = float(self.get_parameter('wall_dedupe_dist_back').value)
         self.WALL_MAX_PROJ = float(self.get_parameter('wall_max_proj').value)
         self.CAMERA_HFOV = float(self.get_parameter('camera_hfov').value)
-        self._min_area_frac = float(self.get_parameter('color_min_area_fraction').value)
+        self.MIN_COLOR_RATIO = float(self.get_parameter('min_color_ratio').value)
         self._publish_debug = self.get_parameter('publish_debug_image').value
+        self._strict = bool(self.get_parameter('strict_count_gates').value)
         self._stable_frames = max(1, int(self.get_parameter('stable_color_frames').value))
         self._max_dist_count = float(self.get_parameter('max_wall_distance_to_count').value)
         self._centroid_max_abs = float(self.get_parameter('centroid_max_abs').value)
@@ -137,9 +129,11 @@ class ColorWallCounter(Node):
         self.counts = {k: 0 for k in _PT_ORDER}
         self.detection_positions = {k: [] for k in _PT_ORDER}
 
+        mode = 'strict extra gates' if self._strict else 'robotica-style (default)'
         self.get_logger().info(
-            f'color_wall_counter — max_dist={self._max_dist_count}m bearing<={self._max_bearing_deg}° '
-            f'front<={self._max_front_range}m dedupe_back={self.WALL_DEDUPE_DIST_BACK}m'
+            f'color_wall_counter — mode={mode} image={img_topic} '
+            f'min_ratio={self.MIN_COLOR_RATIO} hfov={self.CAMERA_HFOV:.4f}rad '
+            f'dedupe={self.WALL_DEDUPE_DIST}m back={self.WALL_DEDUPE_DIST_BACK}m'
         )
 
     def _odom_cb(self, msg: Odometry):
@@ -165,12 +159,13 @@ class ColorWallCounter(Node):
             tint = np.zeros_like(bgr)
             tint[mask > 0] = clr
             cv2.addWeighted(tint, 0.5, overlay, 0.5, 0, overlay)
+            pt = RGB_TO_PT.get(detected, detected)
             cv2.putText(
                 overlay,
-                detected.upper(),
+                f'{detected}/{pt}',
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.7,
                 clr,
                 2,
             )
@@ -216,8 +211,8 @@ class ColorWallCounter(Node):
             self.get_logger().warn(f'cv_bridge error: {exc}')
             return
 
-        color, masks, centroid_x = dominant_wall_color_from_bgr(
-            bgr, min_area_fraction=self._min_area_frac
+        color, masks, centroid_x = detect_dominant_color_robotica(
+            bgr, self.MIN_COLOR_RATIO
         )
         self._publish_debug_image(bgr, masks, color)
 
@@ -227,23 +222,22 @@ class ColorWallCounter(Node):
             self._streak_count = 0
             return
 
-        if (
-            centroid_x is not None
-            and self._centroid_max_abs < 1.0
-            and abs(centroid_x) > self._centroid_max_abs
-        ):
-            self._streak_color = None
-            self._streak_count = 0
-            return
-
-        if color != self._streak_color:
-            self._streak_color = color
-            self._streak_count = 1
-        else:
-            self._streak_count += 1
-
-        if self._streak_count < self._stable_frames:
-            return
+        if self._strict:
+            if (
+                centroid_x is not None
+                and self._centroid_max_abs < 1.0
+                and abs(centroid_x) > self._centroid_max_abs
+            ):
+                self._streak_color = None
+                self._streak_count = 0
+                return
+            if color != self._streak_color:
+                self._streak_color = color
+                self._streak_count = 1
+            else:
+                self._streak_count += 1
+            if self._streak_count < self._stable_frames:
+                return
 
         if color == self._prev_color:
             return
@@ -252,9 +246,6 @@ class ColorWallCounter(Node):
         if centroid_x is not None:
             lidar_rad = -centroid_x * self.CAMERA_HFOV
             lidar_deg = math.degrees(lidar_rad)
-
-        if abs(lidar_deg) > self._max_bearing_deg:
-            return
 
         rx, ry, ryaw = self.current_pose
         if self.latest_scan is not None:
@@ -268,7 +259,7 @@ class ColorWallCounter(Node):
                 window_deg=8.0,
                 max_r=cap,
             )
-            dist = min(dist, cap)
+            dist = min(dist, self.WALL_MAX_PROJ)
             dist_front = range_at(
                 scan.ranges,
                 scan.angle_min,
@@ -282,15 +273,19 @@ class ColorWallCounter(Node):
             dist = self.WALL_MAX_PROJ
             dist_front = self.WALL_MAX_PROJ
 
-        if dist > self._max_dist_count:
-            return
+        if self._strict:
+            if abs(lidar_deg) > self._max_bearing_deg:
+                return
+            if dist > self._max_dist_count:
+                return
+            if dist_front > self._max_front_range:
+                return
+            if abs(dist - dist_front) > self._max_range_disagree:
+                return
 
-        # Not facing a nearby obstacle ahead — typical when glancing along a wall in motion
-        if dist_front > self._max_front_range:
-            return
-
-        if abs(dist - dist_front) > self._max_range_disagree:
-            return
+        # robotica-main: after passing optional gates, lock this colour episode (one LiDAR solve per streak)
+        if not self._strict:
+            self._prev_color = color
 
         wall_angle = ryaw + math.radians(lidar_deg)
         wall_x = rx + dist * math.cos(wall_angle)
@@ -314,19 +309,22 @@ class ColorWallCounter(Node):
                 break
 
         if already:
-            # Same physical wall re-seen: hold _prev_color so we do not re-run dedupe every frame.
-            self._prev_color = color
+            if self._strict:
+                self._prev_color = color
             return
 
+        if self._strict:
+            self._prev_color = color
+
         self._seen_walls.append((wall_x, wall_y, ryaw, color))
-        self.counts[color] += 1
-        self.detection_positions[color].append((wall_x, wall_y))
-        self._prev_color = color
+        pt = RGB_TO_PT[color]
+        self.counts[pt] += 1
+        self.detection_positions[pt].append((wall_x, wall_y))
 
         placar = self._format_placar()
         self.get_logger().info(
-            f'[VISAO] Parede {color.upper()} — '
-            f'wall≈({wall_x:.2f},{wall_y:.2f}) dist={dist:.2f}m | {placar}'
+            f'[VISAO] Parede {pt.upper()} — wall≈({wall_x:.2f},{wall_y:.2f}) '
+            f'dist={dist:.2f}m | {placar}'
         )
 
     def _format_placar(self) -> str:
