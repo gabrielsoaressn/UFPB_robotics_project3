@@ -500,6 +500,7 @@ class MazeNavigator(Node):
                 self.state = 'COLOR_CHECK'
                 self.color_check_count   = 0
                 self.color_check_samples = []
+                self.lat_cmd = 0.0
                 self.get_logger().warn(
                     f'[NAV] TURNING concluído mas frente ainda bloqueada '
                     f'(F={self.front_dist:.2f}m) → COLOR_CHECK novamente')
@@ -514,7 +515,7 @@ class MazeNavigator(Node):
         else:
             twist.linear.x  = 0.0
             twist.linear.y  = 0.0
-            twist.angular.z = self.TURN_SPEED * self.turn_direction
+            twist.angular.z = self.TURN_SPEED * math.copysign(1.0, error)
             if self.loop_count % 5 == 0:
                 self.get_logger().info(
                     f'[NAV] TURNING  erro={math.degrees(error):.1f}°  '
