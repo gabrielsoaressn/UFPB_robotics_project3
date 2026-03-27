@@ -18,6 +18,10 @@ Estados:
 Topicos:
   Assina: /jetauto/lidar/scan, /odometry/filtered, /jetauto/camera/image_raw (Gazebo URDF)
   Publica: /jetauto/cmd_vel
+
+Seguranca frontal (heuristica, nao garantia formal):
+  - Se frente <= FRONT_BLOCKED: para e inicia giro.
+  - Velocidade linear.x reduz entre FRONT_BLOCKED e FRONT_SLOW_FULL (freio suave).
 """
 
 import math
@@ -73,7 +77,10 @@ class MazeNavigator(Node):
     L_DIAG_ANGLE = math.radians(45)
 
     # -- Limiares de distancia (metros) --
-    FRONT_BLOCKED  = 0.5
+    # Below FRONT_BLOCKED: stop forward motion and plan turn (collision avoidance).
+    FRONT_BLOCKED = 0.5
+    # Between FRONT_BLOCKED and FRONT_SLOW_FULL: scale linear.x down (soft braking).
+    FRONT_SLOW_FULL = 0.95
     WALL_DETECT    = 1.2
     SIDE_OPEN      = 1.0    # distancia acima da qual o lado esta "aberto"
     TARGET_SIDE    = 0.4
@@ -206,6 +213,24 @@ class MazeNavigator(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
+
+    def _forward_speed_safe(self) -> float:
+        """
+        Forward speed scaled by frontal LiDAR distance. No mathematical guarantee of
+        no contact (sensor rate, noise, inertia), but avoids driving at full speed
+        into the last half-metre in front of the robot.
+        """
+        fd = self.front_dist
+        if fd <= self.FRONT_BLOCKED:
+            return 0.0
+        if fd >= self.FRONT_SLOW_FULL:
+            return self.FORWARD_SPEED
+        span = self.FRONT_SLOW_FULL - self.FRONT_BLOCKED
+        if span <= 1e-6:
+            return self.FORWARD_SPEED
+        t = (fd - self.FRONT_BLOCKED) / span
+        # Keep a small minimum so the robot can still creep in very tight geometry
+        return self.FORWARD_SPEED * max(0.12, min(1.0, t))
 
     def _start_turn(self, target_yaw, direction, desc):
         """Inicia um giro para target_yaw."""
@@ -354,7 +379,7 @@ class MazeNavigator(Node):
             self._had_right_wall = True
 
         # -- Movimento normal --
-        twist.linear.x  = self.FORWARD_SPEED
+        twist.linear.x  = self._forward_speed_safe()
         twist.linear.y  = self._lateral_correction()
         twist.angular.z = self._heading_correction()
 
@@ -415,7 +440,7 @@ class MazeNavigator(Node):
             twist.angular.z = 0.0
             return
 
-        twist.linear.x  = self.FORWARD_SPEED
+        twist.linear.x  = self._forward_speed_safe()
         twist.linear.y  = self._lateral_correction()
         twist.angular.z = self._heading_correction()
 

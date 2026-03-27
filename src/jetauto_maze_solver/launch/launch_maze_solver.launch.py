@@ -20,8 +20,18 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': True,
                 'camera_hfov': 1.2,
-                # Gazebo only: keep false. Set true + rqt_image_view on /jetauto/camera/color_debug to tune vision.
                 'publish_debug_image': False,
+                'wall_max_proj': 4.0,
+                'wall_dedupe_dist': 2.4,
+                'wall_dedupe_dist_back': 5.5,
+                'stable_color_frames': 4,
+                'color_min_area_fraction': 0.065,
+                'max_wall_distance_to_count': 1.65,
+                'centroid_max_abs': 0.32,
+                'max_lidar_bearing_deg': 20.0,
+                'max_front_range_for_count': 2.05,
+                'front_window_deg': 14.0,
+                'max_range_vs_front_disagree': 0.75,
             }],
         ),
     ])

@@ -3,8 +3,12 @@
 Colored wall counting for Gazebo + maze_navigator stack (no RViz required).
 
 Uses the same camera rules as maze_navigator (camera_color_config): HSV bands,
-minimum area fraction, winner selection. LiDAR + centroid bearing is only used
-here to estimate wall pose and deduplicate front/back views.
+minimum area fraction, winner selection. LiDAR + centroid bearing estimates wall
+pose for deduplication (front/back).
+
+Extra gating: stable frames, strict max range, centroid + LiDAR bearing (reject
+side glances when passing a wall), front LiDAR must show a nearby obstacle (reject
+long straight corridors), enlarged back-face dedupe radius for same wall.
 
 Optional: publish /jetauto/camera/color_debug for rqt_image_view (off by default).
 """
@@ -64,9 +68,12 @@ _COLOR_BGR = {
 
 
 class ColorWallCounter(Node):
-    WALL_DEDUPE_DIST = 2.0
-    WALL_DEDUPE_DIST_BACK = 3.0
-    WALL_MAX_PROJ = 1.925
+    # Same-side duplicate detections (odom noise / wobble)
+    WALL_DEDUPE_DIST = 2.4
+    # Opposite approach to same thin wall — must exceed wall thickness + both projections
+    WALL_DEDUPE_DIST_BACK = 5.5
+    # Cap for LiDAR projection; keep >= longest corridor sightline you expect
+    WALL_MAX_PROJ = 4.0
     # UFPB depth_camera.urdf.xacro horizontal_fov
     CAMERA_HFOV = 1.2
 
@@ -82,6 +89,19 @@ class ColorWallCounter(Node):
         self.declare_parameter('camera_hfov', self.CAMERA_HFOV)
         self.declare_parameter('color_min_area_fraction', COLOR_MIN_AREA_FRAC)
         self.declare_parameter('publish_debug_image', False)
+        # Require N consecutive camera frames with same dominant color (reduces flicker / false triggers)
+        self.declare_parameter('stable_color_frames', 3)
+        # Max range along color bearing to accept a count (stay strict — avoids “far” counts)
+        self.declare_parameter('max_wall_distance_to_count', 1.65)
+        # Centroid must stay near image centre (reject corners / walls glimpsed from the side)
+        self.declare_parameter('centroid_max_abs', 0.32)
+        # |bearing from colour blob| must be below this (deg); side walls while passing exceed it
+        self.declare_parameter('max_lidar_bearing_deg', 20.0)
+        # Min range straight ahead must be <= this (m); open corridor ahead => do not count
+        self.declare_parameter('max_front_range_for_count', 2.05)
+        self.declare_parameter('front_window_deg', 14.0)
+        # Optional: |dist(bearing) - dist(straight ahead)| must be <= this (m) when counting
+        self.declare_parameter('max_range_vs_front_disagree', 0.75)
 
         img_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
@@ -92,6 +112,13 @@ class ColorWallCounter(Node):
         self.CAMERA_HFOV = float(self.get_parameter('camera_hfov').value)
         self._min_area_frac = float(self.get_parameter('color_min_area_fraction').value)
         self._publish_debug = self.get_parameter('publish_debug_image').value
+        self._stable_frames = max(1, int(self.get_parameter('stable_color_frames').value))
+        self._max_dist_count = float(self.get_parameter('max_wall_distance_to_count').value)
+        self._centroid_max_abs = float(self.get_parameter('centroid_max_abs').value)
+        self._max_bearing_deg = float(self.get_parameter('max_lidar_bearing_deg').value)
+        self._max_front_range = float(self.get_parameter('max_front_range_for_count').value)
+        self._front_window_deg = float(self.get_parameter('front_window_deg').value)
+        self._max_range_disagree = float(self.get_parameter('max_range_vs_front_disagree').value)
 
         self.bridge = CvBridge()
         self.create_subscription(Image, img_topic, self._image_cb, 10)
@@ -103,15 +130,16 @@ class ColorWallCounter(Node):
         self.current_pose = None
         self.latest_scan = None
         self._prev_color = None
+        self._streak_color = None
+        self._streak_count = 0
         self._seen_walls = []
 
         self.counts = {k: 0 for k in _PT_ORDER}
         self.detection_positions = {k: [] for k in _PT_ORDER}
 
         self.get_logger().info(
-            f'color_wall_counter — aligned with maze_navigator camera; '
-            f'image={img_topic} scan={scan_topic} hfov={self.CAMERA_HFOV:.4f} '
-            f'min_area_frac={self._min_area_frac} debug_image={self._publish_debug}'
+            f'color_wall_counter — max_dist={self._max_dist_count}m bearing<={self._max_bearing_deg}° '
+            f'front<={self._max_front_range}m dedupe_back={self.WALL_DEDUPE_DIST_BACK}m'
         )
 
     def _odom_cb(self, msg: Odometry):
@@ -195,31 +223,74 @@ class ColorWallCounter(Node):
 
         if color is None:
             self._prev_color = None
+            self._streak_color = None
+            self._streak_count = 0
+            return
+
+        if (
+            centroid_x is not None
+            and self._centroid_max_abs < 1.0
+            and abs(centroid_x) > self._centroid_max_abs
+        ):
+            self._streak_color = None
+            self._streak_count = 0
+            return
+
+        if color != self._streak_color:
+            self._streak_color = color
+            self._streak_count = 1
+        else:
+            self._streak_count += 1
+
+        if self._streak_count < self._stable_frames:
             return
 
         if color == self._prev_color:
             return
-        self._prev_color = color
 
         lidar_deg = 0.0
         if centroid_x is not None:
             lidar_rad = -centroid_x * self.CAMERA_HFOV
             lidar_deg = math.degrees(lidar_rad)
 
+        if abs(lidar_deg) > self._max_bearing_deg:
+            return
+
         rx, ry, ryaw = self.current_pose
         if self.latest_scan is not None:
             scan = self.latest_scan
+            cap = min(self.WALL_MAX_PROJ, float(scan.range_max))
             dist = range_at(
                 scan.ranges,
                 scan.angle_min,
                 scan.angle_increment,
                 lidar_deg,
                 window_deg=8.0,
-                max_r=self.WALL_MAX_PROJ,
+                max_r=cap,
             )
-            dist = min(dist, self.WALL_MAX_PROJ)
+            dist = min(dist, cap)
+            dist_front = range_at(
+                scan.ranges,
+                scan.angle_min,
+                scan.angle_increment,
+                0.0,
+                window_deg=self._front_window_deg,
+                max_r=cap,
+            )
+            dist_front = min(dist_front, cap)
         else:
             dist = self.WALL_MAX_PROJ
+            dist_front = self.WALL_MAX_PROJ
+
+        if dist > self._max_dist_count:
+            return
+
+        # Not facing a nearby obstacle ahead — typical when glancing along a wall in motion
+        if dist_front > self._max_front_range:
+            return
+
+        if abs(dist - dist_front) > self._max_range_disagree:
+            return
 
         wall_angle = ryaw + math.radians(lidar_deg)
         wall_x = rx + dist * math.cos(wall_angle)
@@ -243,11 +314,14 @@ class ColorWallCounter(Node):
                 break
 
         if already:
+            # Same physical wall re-seen: hold _prev_color so we do not re-run dedupe every frame.
+            self._prev_color = color
             return
 
         self._seen_walls.append((wall_x, wall_y, ryaw, color))
         self.counts[color] += 1
         self.detection_positions[color].append((wall_x, wall_y))
+        self._prev_color = color
 
         placar = self._format_placar()
         self.get_logger().info(
