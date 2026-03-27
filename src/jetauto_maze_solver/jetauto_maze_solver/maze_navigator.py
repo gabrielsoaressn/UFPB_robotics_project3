@@ -89,7 +89,7 @@ class MazeNavigator(Node):
 
         self.create_subscription(LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
-        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Image, '/jetauto/camera/image_raw', self._image_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, '/jetauto/cmd_vel', 10)
         self.bridge = CvBridge()
@@ -102,7 +102,9 @@ class MazeNavigator(Node):
 
         self.odom_x, self.odom_y, self.current_yaw = 0.0, 0.0, 0.0
 
-        self.detected_color = None
+        self.detected_color  = None
+        self.last_seen_color = None   # cor vista ao passar por passagem lateral
+        self.approach_color  = None   # cor capturada no momento de parar
         self.lat_cmd = 0.0
         self.visited_cells: set = set()
 
@@ -248,9 +250,14 @@ class MazeNavigator(Node):
         if self.front_dist <= self.FRONT_BLOCKED:
             self.state = 'COLOR_CHECK'
             self.color_check_count, self.color_check_samples = 0, []
+            self.approach_color = self.detected_color  # salva cor vista durante a abordagem
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
+
+        # Registra cor vista enquanto passa por passagem lateral aberta
+        if self.detected_color is not None and (self.left_dist > 0.8 or self.right_dist > 0.8):
+            self.last_seen_color = self.detected_color
 
         self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * self._lateral_correction()
         twist.linear.x, twist.linear.y, twist.angular.z = self.FORWARD_SPEED, self.lat_cmd, self._heading_correction()
@@ -266,11 +273,14 @@ class MazeNavigator(Node):
         self.color_check_count += 1
 
         if self.color_check_count >= self.COLOR_CHECK_CYCLES:
-            counts = Counter(self.color_check_samples)
-            color_decision = counts.most_common(1)[0][0]
+            colored = [c for c in self.color_check_samples if c is not None]
+            color_decision = (Counter(colored).most_common(1)[0][0] if colored
+                              else self.last_seen_color or self.approach_color)
+            self.last_seen_color = None
+            self.approach_color  = None
             self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
             self.state = 'TURNING'
-            self.get_logger().info(f'[NAV] Decisão: {desc}')
+            self.get_logger().info(f'[NAV] Decisão: {desc} | frente={len(colored)} amostras')
 
     def _state_turning(self, twist: Twist):
         """Gira pela odometria até atingir target_yaw."""
