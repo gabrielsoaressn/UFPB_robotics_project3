@@ -64,7 +64,7 @@ class MazeNavigator(Node):
     ALIGN_CLAMP = 0.15
 
     # Velocidades
-    FORWARD_SPEED = 0.25
+    FORWARD_SPEED = 0.20
     TURN_SPEED    = 0.7
     YAW_TOLERANCE = 0.05
 
@@ -273,15 +273,12 @@ class MazeNavigator(Node):
             self.get_logger().info(f'[NAV] Decisão: {desc}')
 
     def _state_turning(self, twist: Twist):
-        """Gira pela odometria até atingir target_yaw."""
-        odom_error = normalize_angle(self.target_yaw - self.current_yaw)
-
-        if abs(odom_error) < self.YAW_TOLERANCE:
+        """Gira na direção escolhida até a frente ficar livre (ângulo ditado pelas paredes)."""
+        if self.front_dist > self.FRONT_BLOCKED + 0.15:
             self.state = 'FOLLOW_CORRIDOR'
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
-            self.get_logger().info(
-                f'[NAV] Giro finalizado. Erro: {math.degrees(odom_error):.1f}°')
+            self.get_logger().info('[NAV] Giro finalizado (frente livre)')
         else:
             twist.linear.x = twist.linear.y = 0.0
             twist.angular.z = self.TURN_SPEED * self.turn_direction
