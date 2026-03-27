@@ -111,6 +111,7 @@ class MazeNavigator(Node):
 
         self.detected_color = None
         self.last_seen_color = None   # cor vista ao passar por passagem lateral
+        self.approach_color  = None   # cor capturada no momento de parar
         self.lat_cmd = 0.0
         self.visited_cells: set = set()
 
@@ -258,6 +259,7 @@ class MazeNavigator(Node):
         if self.front_dist <= self.FRONT_BLOCKED:
             self.state = 'COLOR_CHECK'
             self.color_check_count, self.color_check_samples = 0, []
+            self.approach_color = self.detected_color  # salva cor vista durante a abordagem
             self.lat_cmd = 0.0
             twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
@@ -284,8 +286,9 @@ class MazeNavigator(Node):
         if self.color_check_count >= self.COLOR_CHECK_CYCLES:
             colored = [c for c in self.color_check_samples if c is not None]
             lateral = self.last_seen_color
-            color_decision = Counter(colored).most_common(1)[0][0] if colored else lateral
+            color_decision = Counter(colored).most_common(1)[0][0] if colored else (lateral or self.approach_color)
             self.last_seen_color = None
+            self.approach_color  = None
             self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
             self.state = 'TURNING'
             self.get_logger().info(f'[NAV] Decisão: {desc} | frente={len(colored)} amostras, lateral={lateral}')
