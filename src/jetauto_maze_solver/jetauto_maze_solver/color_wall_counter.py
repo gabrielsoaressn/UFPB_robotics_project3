@@ -1,356 +1,245 @@
 #!/usr/bin/env python3
 """
-Colored wall counting for Gazebo + maze_navigator stack (no RViz required).
+Sistema de Visão — Detecção e Contagem de Paredes Coloridas
 
-Uses the same camera rules as maze_navigator (camera_color_config): HSV bands,
-minimum area fraction, winner selection. LiDAR + centroid bearing estimates wall
-pose for deduplication (front/back).
+Detecta paredes Azuis, Verdes e Vermelhas (e Amarelas) usando câmera RGB.
 
-Extra gating: stable frames, strict max range, centroid + LiDAR bearing (reject
-side glances when passing a wall), front LiDAR must show a nearby obstacle (reject
-long straight corridors), enlarged back-face dedupe radius for same wall.
+Deduplicação por posição:
+  Quando uma parede é detectada, estima-se a posição da parede no mundo:
+    wall_x = robot_x + front_dist * cos(yaw)
+    wall_y = robot_y + front_dist * sin(yaw)
+  Se já existe uma parede da mesma cor a menos de DEDUP_DIST metros,
+  assume-se que é a mesma parede (ou o seu verso) e não é recontada.
 
-Optional: publish /jetauto/camera/color_debug for rqt_image_view (off by default).
+Este nó NUNCA publica comandos de velocidade.
+
+Tópicos assinados:
+  /jetauto/camera/image_raw   — frame RGB da câmera
+  /odometry/filtered          — posição e orientação do robô
+  /jetauto/lidar/scan         — distância frontal até a parede
 """
 
-from __future__ import annotations
-
 import math
-import os
-from datetime import datetime
-
-import cv2
-import numpy as np
 import rclpy
-from cv_bridge import CvBridge
-from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image, LaserScan
-
-from jetauto_maze_solver.camera_color_config import (
-    COLOR_MIN_AREA_FRAC,
-    dominant_wall_color_from_bgr,
-)
-
-
-def yaw_from_quat(q) -> float:
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny, cosy)
+from nav_msgs.msg import Odometry
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
 
 
-def range_at(
-    ranges,
-    angle_min: float,
-    angle_inc: float,
-    deg: float,
-    window_deg: float = 15.0,
-    max_r: float = 3.0,
-) -> float:
-    rad = math.radians(deg)
-    hw = math.radians(window_deg)
-    vals = [
-        r
-        for i, r in enumerate(ranges)
-        if abs(angle_min + i * angle_inc - rad) <= hw and math.isfinite(r) and r > 0.05
-    ]
-    return min(vals) if vals else max_r
-
-
-_PT_ORDER = ('vermelho', 'verde', 'azul')
-_COLOR_LABELS = {'azul': 'A', 'verde': 'V', 'vermelho': 'R'}
-
-_COLOR_BGR = {
-    'vermelho': (0, 0, 255),
-    'verde': (0, 255, 0),
-    'azul': (255, 0, 0),
-}
+def yaw_from_quaternion(q):
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class ColorWallCounter(Node):
-    # Same-side duplicate detections (odom noise / wobble)
-    WALL_DEDUPE_DIST = 2.4
-    # Opposite approach to same thin wall — must exceed wall thickness + both projections
-    WALL_DEDUPE_DIST_BACK = 5.5
-    # Cap for LiDAR projection; keep >= longest corridor sightline you expect
-    WALL_MAX_PROJ = 4.0
-    # UFPB depth_camera.urdf.xacro horizontal_fov
-    CAMERA_HFOV = 1.2
+
+    # ── Área mínima do contorno (fração da imagem) ─────────────────
+    # A cor deve ocupar pelo menos 8% da imagem para ser considerada
+    # uma parede próxima/frontal (filtra reflexos e objetos distantes).
+    MIN_AREA_FRACTION = 0.08
+
+    # ── Deduplicação por posição ───────────────────────────────────
+    # Duas detecções da mesma cor a menos de DEDUP_DIST metros
+    # são tratadas como a mesma parede (ou o seu verso).
+    DEDUP_DIST = 0.8    # metros
+
+    # ── Cooldown mínimo (segundos) ─────────────────────────────────
+    # Barreira temporal extra para evitar dupla contagem rápida
+    # no mesmo local (ex.: câmera tremendo).
+    COOLDOWN_SECS = 2.0
+
+    # ── LiDAR: setor frontal para estimar distância à parede ───────
+    FRONT_LO = math.radians(-20)
+    FRONT_HI = math.radians(20)
+    RANGE_CAP = 3.0
+    LIDAR_MIN_VALID = 0.15
+
+    # ── Velocidade maxima para deteccao (robo parado) ──────────────
+    MAX_SPEED = 0.05
+    MAX_ANGULAR_SPEED = 0.1
+
+    # ── Faixas HSV para cada cor ───────────────────────────────────
+    COLOR_RANGES = {
+        'azul': [
+            (np.array([100, 80, 50]), np.array([130, 255, 255])),
+        ],
+        'verde': [
+            (np.array([40, 80, 50]), np.array([85, 255, 255])),
+        ],
+        'vermelho': [
+            (np.array([0,   80, 50]), np.array([10,  255, 255])),
+            (np.array([170, 80, 50]), np.array([180, 255, 255])),
+        ],
+        'amarelo': [
+            (np.array([20, 80, 50]), np.array([40, 255, 255])),
+        ],
+    }
+
+    COLOR_LABELS = {'azul': 'A', 'verde': 'V', 'vermelho': 'R', 'amarelo': 'Y'}
 
     def __init__(self):
         super().__init__('color_wall_counter')
 
-        self.declare_parameter('image_topic', '/jetauto/camera/image_raw')
-        self.declare_parameter('odom_topic', '/odometry/filtered')
-        self.declare_parameter('scan_topic', '/jetauto/lidar/scan')
-        self.declare_parameter('wall_dedupe_dist', self.WALL_DEDUPE_DIST)
-        self.declare_parameter('wall_dedupe_dist_back', self.WALL_DEDUPE_DIST_BACK)
-        self.declare_parameter('wall_max_proj', self.WALL_MAX_PROJ)
-        self.declare_parameter('camera_hfov', self.CAMERA_HFOV)
-        self.declare_parameter('color_min_area_fraction', COLOR_MIN_AREA_FRAC)
-        self.declare_parameter('publish_debug_image', False)
-        # Require N consecutive camera frames with same dominant color (reduces flicker / false triggers)
-        self.declare_parameter('stable_color_frames', 3)
-        # Max range along color bearing to accept a count (stay strict — avoids “far” counts)
-        self.declare_parameter('max_wall_distance_to_count', 1.65)
-        # Centroid must stay near image centre (reject corners / walls glimpsed from the side)
-        self.declare_parameter('centroid_max_abs', 0.32)
-        # |bearing from colour blob| must be below this (deg); side walls while passing exceed it
-        self.declare_parameter('max_lidar_bearing_deg', 20.0)
-        # Min range straight ahead must be <= this (m); open corridor ahead => do not count
-        self.declare_parameter('max_front_range_for_count', 2.05)
-        self.declare_parameter('front_window_deg', 14.0)
-        # Optional: |dist(bearing) - dist(straight ahead)| must be <= this (m) when counting
-        self.declare_parameter('max_range_vs_front_disagree', 0.75)
-
-        img_topic = self.get_parameter('image_topic').get_parameter_value().string_value
-        odom_topic = self.get_parameter('odom_topic').get_parameter_value().string_value
-        scan_topic = self.get_parameter('scan_topic').get_parameter_value().string_value
-        self.WALL_DEDUPE_DIST = float(self.get_parameter('wall_dedupe_dist').value)
-        self.WALL_DEDUPE_DIST_BACK = float(self.get_parameter('wall_dedupe_dist_back').value)
-        self.WALL_MAX_PROJ = float(self.get_parameter('wall_max_proj').value)
-        self.CAMERA_HFOV = float(self.get_parameter('camera_hfov').value)
-        self._min_area_frac = float(self.get_parameter('color_min_area_fraction').value)
-        self._publish_debug = self.get_parameter('publish_debug_image').value
-        self._stable_frames = max(1, int(self.get_parameter('stable_color_frames').value))
-        self._max_dist_count = float(self.get_parameter('max_wall_distance_to_count').value)
-        self._centroid_max_abs = float(self.get_parameter('centroid_max_abs').value)
-        self._max_bearing_deg = float(self.get_parameter('max_lidar_bearing_deg').value)
-        self._max_front_range = float(self.get_parameter('max_front_range_for_count').value)
-        self._front_window_deg = float(self.get_parameter('front_window_deg').value)
-        self._max_range_disagree = float(self.get_parameter('max_range_vs_front_disagree').value)
-
         self.bridge = CvBridge()
-        self.create_subscription(Image, img_topic, self._image_cb, 10)
-        self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
-        self.create_subscription(LaserScan, scan_topic, self._scan_cb, 10)
 
-        self.debug_pub = self.create_publisher(Image, '/jetauto/camera/color_debug', 10)
+        self.create_subscription(
+            Image, '/jetauto/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(
+            Odometry, '/odometry/filtered', self._odom_cb, 10)
+        self.create_subscription(
+            LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
 
-        self.current_pose = None
-        self.latest_scan = None
-        self._prev_color = None
-        self._streak_color = None
-        self._streak_count = 0
-        self._seen_walls = []
+        # Posição e orientação do robô
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.current_yaw = 0.0
 
-        self.counts = {k: 0 for k in _PT_ORDER}
-        self.detection_positions = {k: [] for k in _PT_ORDER}
+        # Velocidade do robô
+        self.robot_speed = 0.0
+        self.robot_angular_speed = 0.0
+        self.odom_ready = False
+
+        # Distância frontal (estimativa da distância à parede à frente)
+        self.front_dist = self.RANGE_CAP
+
+        # Contagens por cor
+        self.counts = {color: 0 for color in self.COLOR_RANGES}
+
+        # Lista de posições de paredes já contadas por cor: [(x, y), ...]
+        self.wall_positions = {color: [] for color in self.COLOR_RANGES}
+
+        # Timestamp da última detecção por cor (cooldown mínimo)
+        self.last_detection_time = {color: None for color in self.COLOR_RANGES}
 
         self.get_logger().info(
-            f'color_wall_counter — max_dist={self._max_dist_count}m bearing<={self._max_bearing_deg}° '
-            f'front<={self._max_front_range}m dedupe_back={self.WALL_DEDUPE_DIST_BACK}m'
-        )
+            '[VISÃO] Sistema de Visão iniciado — deduplicação por posição  '
+            f'DEDUP_DIST={self.DEDUP_DIST}m  COOLDOWN={self.COOLDOWN_SECS}s  '
+            f'MAX_SPEED={self.MAX_SPEED}m/s  MAX_ANG={self.MAX_ANGULAR_SPEED}rad/s')
+
+    # ══════════════════════════════════════════════════════════════════
+    # Callbacks dos sensores
+    # ══════════════════════════════════════════════════════════════════
 
     def _odom_cb(self, msg: Odometry):
-        self.current_pose = (
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            yaw_from_quat(msg.pose.pose.orientation),
-        )
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+        self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        self.robot_speed = math.sqrt(vx * vx + vy * vy)
+        self.robot_angular_speed = abs(msg.twist.twist.angular.z)
+        self.odom_ready = True
 
     def _scan_cb(self, msg: LaserScan):
-        self.latest_scan = msg
-
-    def _publish_debug_image(self, bgr: np.ndarray, masks: dict, detected: str | None):
-        if not self._publish_debug:
+        """Extrai distância mínima no setor frontal."""
+        ranges = msg.ranges
+        n = len(ranges)
+        if n == 0:
             return
-        overlay = bgr.copy()
-        h, w = bgr.shape[:2]
-        cv2.line(overlay, (w // 2, 0), (w // 2, h), (80, 80, 80), 1)
+        a_min = msg.angle_min
+        a_inc = msg.angle_increment
 
-        if detected is not None and detected in masks:
-            mask = masks[detected]
-            clr = _COLOR_BGR[detected]
-            tint = np.zeros_like(bgr)
-            tint[mask > 0] = clr
-            cv2.addWeighted(tint, 0.5, overlay, 0.5, 0, overlay)
-            cv2.putText(
-                overlay,
-                detected.upper(),
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                clr,
-                2,
-            )
-            M = cv2.moments(mask)
-            if M['m00'] > 0:
-                cx_px = int(M['m10'] / M['m00'])
-                cy_px = int(M['m01'] / M['m00'])
-                norm_x = (cx_px - w / 2.0) / w
-                lidar_deg = -norm_x * math.degrees(self.CAMERA_HFOV)
-                cv2.drawMarker(overlay, (cx_px, cy_px), clr, cv2.MARKER_CROSS, 20, 2)
-                cv2.line(overlay, (w // 2, cy_px), (cx_px, cy_px), clr, 1)
-                cv2.putText(
-                    overlay,
-                    f'lidar {lidar_deg:+.1f}deg',
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    clr,
-                    2,
-                )
-        else:
-            cv2.putText(
-                overlay,
-                'Sem cor',
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (200, 200, 200),
-                2,
-            )
-        try:
-            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(overlay, 'bgr8'))
-        except Exception:
-            pass
+        def idx(a):
+            return max(0, min(n - 1, round((a - a_min) / a_inc)))
+
+        best = self.RANGE_CAP
+        for i in range(min(idx(self.FRONT_LO), idx(self.FRONT_HI)),
+                       max(idx(self.FRONT_LO), idx(self.FRONT_HI)) + 1):
+            r = ranges[i]
+            if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
+                best = min(best, min(r, self.RANGE_CAP))
+        self.front_dist = best
 
     def _image_cb(self, msg: Image):
-        if self.current_pose is None:
+        """Processa cada frame: detecta cores e contabiliza paredes novas."""
+        if not self.odom_ready:
+            return
+
+        # Só processa quando o robô está completamente parado
+        if self.robot_speed > self.MAX_SPEED or self.robot_angular_speed > self.MAX_ANGULAR_SPEED:
             return
 
         try:
-            bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception as exc:
-            self.get_logger().warn(f'cv_bridge error: {exc}')
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'[VISÃO] Erro cv_bridge: {e}')
             return
 
-        color, masks, centroid_x = dominant_wall_color_from_bgr(
-            bgr, min_area_fraction=self._min_area_frac
-        )
-        self._publish_debug_image(bgr, masks, color)
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        h, w = hsv.shape[:2]
+        min_area = self.MIN_AREA_FRACTION * h * w
+        now = self.get_clock().now()
 
-        if color is None:
-            self._prev_color = None
-            self._streak_color = None
-            self._streak_count = 0
-            return
+        for color, ranges in self.COLOR_RANGES.items():
+            # Máscara combinada para a cor
+            mask = np.zeros((h, w), dtype=np.uint8)
+            for lower, upper in ranges:
+                mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
 
-        if (
-            centroid_x is not None
-            and self._centroid_max_abs < 1.0
-            and abs(centroid_x) > self._centroid_max_abs
-        ):
-            self._streak_color = None
-            self._streak_count = 0
-            return
-
-        if color != self._streak_color:
-            self._streak_color = color
-            self._streak_count = 1
-        else:
-            self._streak_count += 1
-
-        if self._streak_count < self._stable_frames:
-            return
-
-        if color == self._prev_color:
-            return
-
-        lidar_deg = 0.0
-        if centroid_x is not None:
-            lidar_rad = -centroid_x * self.CAMERA_HFOV
-            lidar_deg = math.degrees(lidar_rad)
-
-        if abs(lidar_deg) > self._max_bearing_deg:
-            return
-
-        rx, ry, ryaw = self.current_pose
-        if self.latest_scan is not None:
-            scan = self.latest_scan
-            cap = min(self.WALL_MAX_PROJ, float(scan.range_max))
-            dist = range_at(
-                scan.ranges,
-                scan.angle_min,
-                scan.angle_increment,
-                lidar_deg,
-                window_deg=8.0,
-                max_r=cap,
-            )
-            dist = min(dist, cap)
-            dist_front = range_at(
-                scan.ranges,
-                scan.angle_min,
-                scan.angle_increment,
-                0.0,
-                window_deg=self._front_window_deg,
-                max_r=cap,
-            )
-            dist_front = min(dist_front, cap)
-        else:
-            dist = self.WALL_MAX_PROJ
-            dist_front = self.WALL_MAX_PROJ
-
-        if dist > self._max_dist_count:
-            return
-
-        # Not facing a nearby obstacle ahead — typical when glancing along a wall in motion
-        if dist_front > self._max_front_range:
-            return
-
-        if abs(dist - dist_front) > self._max_range_disagree:
-            return
-
-        wall_angle = ryaw + math.radians(lidar_deg)
-        wall_x = rx + dist * math.cos(wall_angle)
-        wall_y = ry + dist * math.sin(wall_angle)
-
-        already = False
-        for wx, wy, wyaw, wc in self._seen_walls:
-            if wc != color:
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
                 continue
-            dist_to_known = math.hypot(wall_x - wx, wall_y - wy)
-            angle_diff = abs(
-                math.atan2(math.sin(ryaw - wyaw), math.cos(ryaw - wyaw))
-            )
-            threshold = (
-                self.WALL_DEDUPE_DIST_BACK
-                if angle_diff > math.pi / 2
-                else self.WALL_DEDUPE_DIST
-            )
-            if dist_to_known < threshold:
-                already = True
-                break
 
-        if already:
-            # Same physical wall re-seen: hold _prev_color so we do not re-run dedupe every frame.
-            self._prev_color = color
-            return
+            if cv2.contourArea(max(contours, key=cv2.contourArea)) < min_area:
+                continue
 
-        self._seen_walls.append((wall_x, wall_y, ryaw, color))
-        self.counts[color] += 1
-        self.detection_positions[color].append((wall_x, wall_y))
-        self._prev_color = color
+            # ── Cooldown mínimo ──
+            if not self._cooldown_ok(color, now):
+                continue
 
-        placar = self._format_placar()
-        self.get_logger().info(
-            f'[VISAO] Parede {color.upper()} — '
-            f'wall≈({wall_x:.2f},{wall_y:.2f}) dist={dist:.2f}m | {placar}'
-        )
+            # ── Estima posição da parede no mundo ──
+            wall_x = self.odom_x + self.front_dist * math.cos(self.current_yaw)
+            wall_y = self.odom_y + self.front_dist * math.sin(self.current_yaw)
+
+            # ── Deduplicação por posição ──
+            if self._already_seen(color, wall_x, wall_y):
+                continue
+
+            # ── Nova parede! Registra e contabiliza ──
+            self.wall_positions[color].append((wall_x, wall_y))
+            self.counts[color] += 1
+            self.last_detection_time[color] = now
+
+            placar = self._format_placar()
+            self.get_logger().info(
+                f'[VISÃO] Parede {color.upper()} detectada!  '
+                f'pos_parede=({wall_x:.2f}, {wall_y:.2f})  '
+                f'Placar: {placar}')
+
+    # ══════════════════════════════════════════════════════════════════
+    # Auxiliares
+    # ══════════════════════════════════════════════════════════════════
+
+    def _cooldown_ok(self, color: str, now) -> bool:
+        last = self.last_detection_time[color]
+        if last is None:
+            return True
+        return (now - last).nanoseconds / 1e9 >= self.COOLDOWN_SECS
+
+    def _already_seen(self, color: str, wx: float, wy: float) -> bool:
+        """
+        Retorna True se já existe uma parede da mesma cor registrada
+        a menos de DEDUP_DIST metros de (wx, wy).
+        """
+        for (px, py) in self.wall_positions[color]:
+            if math.hypot(wx - px, wy - py) < self.DEDUP_DIST:
+                return True
+        return False
 
     def _format_placar(self) -> str:
-        return ', '.join(f'{_COLOR_LABELS[k]}:{self.counts[k]}' for k in _PT_ORDER)
+        parts = [f'{self.COLOR_LABELS[c]}:{self.counts[c]}'
+                 for c in self.COLOR_RANGES]
+        return ', '.join(parts)
 
-    def _save_report(self):
-        report_path = os.path.join(os.getcwd(), 'color_wall_report.txt')
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        total = sum(self.counts.values())
-        lines = [
-            '=== Relatorio de Paredes Coloridas ===',
-            f'Data/hora: {timestamp}',
-            '',
-            'Contagem por cor:',
-        ]
-        for k in _PT_ORDER:
-            lines.append(f'  {k.capitalize():10s}: {self.counts[k]}')
-            for i, (wx, wy) in enumerate(self.detection_positions[k], 1):
-                lines.append(f'    #{i} parede estimada em ({wx:.1f}, {wy:.1f})')
-        lines += ['', f'Total de paredes detectadas: {total}']
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines) + '\n')
-        self.get_logger().info(f'[VISAO] Relatorio salvo em {report_path}')
 
+# ═══════════════════════════════════════════════════════════════════════
+# Ponto de entrada
+# ═══════════════════════════════════════════════════════════════════════
 
 def main(args=None):
     rclpy.init(args=args)
@@ -360,12 +249,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node._save_report()
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
