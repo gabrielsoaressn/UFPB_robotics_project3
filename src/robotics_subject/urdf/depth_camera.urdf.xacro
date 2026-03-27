@@ -42,7 +42,7 @@
     type="revolute">
     <origin
       xyz="0.0288581470059471 0 0.202093286991617"
-      rpy="-0.000131510931722419 0 0" />
+      rpy="0 0 1.5708" />
     <parent
       link="base_link" />
     <child
