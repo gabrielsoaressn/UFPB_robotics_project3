@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
 """
-Maze Navigator — Máquina de Estados para Regra da Mão Direita (Robô Diferencial)
+Maze Navigator — Centro do Corredor com Memória Ativa e Visão (Robô Omnidirecional)
 
-Restrição absoluta: linear.y = 0.0 SEMPRE.
-
-Estados:
-  INITIAL_STRAIGHT → Largada segura: vai reto até frente bloqueada
-  FOLLOW_WALL      → Andar reto com alinhamento paralelo à parede direita
-  INNER_CORNER     → Frente bloqueada → parar e girar 90° à esquerda (via TURNING)
-  OUTER_CORNER     → Parede direita sumiu → avançar 0.3m reto, depois girar 90° à direita
-  TURNING          → Giro controlado por odometria até atingir target_yaw
-
-Tópicos:
-  Assina: /jetauto/lidar/scan, /odometry/filtered
-  Publica: /jetauto/cmd_vel
+Lógica:
+- Avança mantendo o centro do corredor via controle proporcional lateral (linear.y) e heading.
+- Ao bloquear a frente, para por 0.5s para amostrar a cor da parede.
+- Gira 90° baseado na cor. Se não houver cor, cruza a viabilidade do LiDAR (onde tem espaço livre)
+  com a grade de memória, escolhendo a direção menos visitada.
 """
 
 import math
+from collections import Counter
+import numpy as np
+import cv2
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-
+from cv_bridge import CvBridge
 
 # ═══════════════════════════════════════════════════════════════════════
-# Utilidades de ângulo
+# Utilitários de ângulo
 # ═══════════════════════════════════════════════════════════════════════
 
 def yaw_from_quaternion(q):
-    """Extrai yaw (rotação em Z) de um quaternion."""
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
-
 def normalize_angle(angle):
-    """Normaliza ângulo para o intervalo [-π, π]."""
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
+    while angle > math.pi: angle -= 2.0 * math.pi
+    while angle < -math.pi: angle += 2.0 * math.pi
     return angle
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # Nó principal
@@ -50,378 +40,245 @@ def normalize_angle(angle):
 
 class MazeNavigator(Node):
 
-    # ── Setores do LiDAR (radianos) ────────────────────────────────
-    # O LiDAR cobre -135° a +135° com 180 amostras.
-    # Frente: cone estreito de ±20° ao redor de 0°
-    FRONT_LO = math.radians(-20)
-    FRONT_HI = math.radians(20)
-    # Direita: setor de -100° a -50° (ângulos negativos = lado direito)
-    RIGHT_LO = math.radians(-100)
-    RIGHT_HI = math.radians(-50)
+    # Setores do LiDAR
+    FRONT_LO, FRONT_HI = math.radians(-20), math.radians(20)
+    LEFT_LO,  LEFT_HI  = math.radians(70),  math.radians(110)
+    RIGHT_LO, RIGHT_HI = math.radians(-110), math.radians(-70)
 
-    # ── Limiares de distância (metros) ─────────────────────────────
-    FRONT_BLOCKED = 0.6     # frente bloqueada → INNER_CORNER
-    RIGHT_PRESENT = 0.8     # considera parede presente à direita
-    RIGHT_LOST    = 0.85    # parede sumiu → OUTER_CORNER
+    # Raios individuais para cálculo de heading
+    R_SIDE_ANGLE, R_DIAG_ANGLE = math.radians(-90), math.radians(-45)
+    L_SIDE_ANGLE, L_DIAG_ANGLE = math.radians(90), math.radians(45)
 
-    # ── Alinhamento paralelo (dois raios à direita) ──────────────
-    ALIGN_SIDE_ANGLE = math.radians(-90)   # raio perpendicular à parede
-    ALIGN_DIAG_ANGLE = math.radians(-45)   # raio diagonal frontal-direita
-    ALIGN_KP    = 1.5    # ganho proporcional de alinhamento
-    ALIGN_CLAMP = 0.1    # correção angular máxima (rad/s)
+    # Limiares de distância
+    FRONT_BLOCKED = 0.60    # Espaço seguro para o chassi girar sem colisões
+    WALL_DETECT   = 1.2     
+    TARGET_SIDE   = 0.40    
 
-    # ── Velocidades ────────────────────────────────────────────────
-    FORWARD_SPEED = 0.15    # m/s linear para frente
-    TURN_SPEED    = 0.4     # rad/s durante giro no estado TURNING
+    # Controle lateral — linear.y (Suavizado)
+    KP_LAT    = 0.15
+    LAT_CLAMP = 0.10
+    LAT_ALPHA = 0.25
 
-    # ── OUTER_CORNER: distância de avanço antes de girar ───────────
-    ADVANCE_DIST = 0.3      # metros
+    # Correção de heading — angular.z
+    ALIGN_KP    = 1.5
+    ALIGN_CLAMP = 0.15
 
-    # ── TURNING: tolerância angular ────────────────────────────────
-    YAW_TOLERANCE = 0.05    # radianos (~2.9°)
+    # Velocidades
+    FORWARD_SPEED = 0.15
+    TURN_SPEED    = 0.4
+    YAW_TOLERANCE = 0.05
 
-    # ── Processamento do LiDAR ─────────────────────────────────────
-    RANGE_CAP       = 3.0   # distância máxima considerada (ignora inf)
-    LIDAR_MIN_VALID = 0.15  # leituras abaixo disto são ruído do sensor
+    RANGE_CAP       = 3.0
+    LIDAR_MIN_VALID = 0.15
+
+    # COLOR_CHECK
+    COLOR_CHECK_CYCLES = 5
+
+    # Anti-backtracking
+    CELL_SIZE       = 0.8   # Aumentado para tolerar drift de odometria a longo prazo
+    BACKTRACK_DISTS = (1.0, 1.5, 2.0)
+
+    # Câmera — faixas HSV
+    COLOR_MIN_AREA_FRAC = 0.05
+    RED_LOWER1, RED_UPPER1 = np.array([0, 80, 50]), np.array([10, 255, 255])
+    RED_LOWER2, RED_UPPER2 = np.array([170, 80, 50]), np.array([180, 255, 255])
+    GREEN_LOWER, GREEN_UPPER = np.array([40, 80, 50]), np.array([85, 255, 255])
 
     def __init__(self):
         super().__init__('maze_navigator')
 
-        # ── Subscribers ──
-        self.create_subscription(
-            LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
-        self.create_subscription(
-            Odometry, '/odometry/filtered', self._odom_cb, 10)
+        self.create_subscription(LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
+        self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
+        self.create_subscription(Image, '/jetauto/camera/image_raw', self._image_cb, 10)
 
-        # ── Publisher ──
         self.cmd_pub = self.create_publisher(Twist, '/jetauto/cmd_vel', 10)
-
-        # ── Timer de controle (10 Hz) ──
+        self.bridge = CvBridge()
         self.timer = self.create_timer(0.1, self._control_loop)
 
-        # ── Dados do LiDAR ──
-        self.front_dist = self.RANGE_CAP
-        self.right_dist = self.RANGE_CAP
-        self.align_side = self.RANGE_CAP   # raio a -90°
-        self.align_diag = self.RANGE_CAP   # raio a -45°
-        self.scan_ready = False
+        self.front_dist, self.left_dist, self.right_dist = self.RANGE_CAP, self.RANGE_CAP, self.RANGE_CAP
+        self.r_side, self.r_diag = self.RANGE_CAP, self.RANGE_CAP
+        self.l_side, self.l_diag = self.RANGE_CAP, self.RANGE_CAP
+        self.scan_ready, self.odom_ready = False, False
 
-        # ── Dados da odometria ──
-        self.odom_x = 0.0
-        self.odom_y = 0.0
-        self.current_yaw = 0.0
-        self.odom_ready = False
+        self.odom_x, self.odom_y, self.current_yaw = 0.0, 0.0, 0.0
 
-        # ── Máquina de Estados ──
-        self.state = 'INITIAL_STRAIGHT'
-        self.target_yaw = 0.0         # yaw alvo para o estado TURNING
-        self.turn_direction = 0.0     # +1.0 = esquerda, -1.0 = direita
-        self.advance_start_x = 0.0   # snapshot de odom para OUTER_CORNER
-        self.advance_start_y = 0.0
+        self.detected_color = None
+        self.lat_cmd = 0.0
+        self.visited_cells: set = set()
 
-        # Só ativa OUTER_CORNER após encontrar parede pela primeira vez,
-        # evitando falso trigger na entrada do labirinto.
-        self.wall_found = False
-
-        # Contador para throttle de logs
+        self.state = 'FOLLOW_CORRIDOR'
+        self.target_yaw = 0.0
+        self.turn_direction = 0.0
+        self.color_check_count = 0
+        self.color_check_samples = []
         self.loop_count = 0
 
-        self.get_logger().info(
-            '[NAV] ═══ Maze Navigator Iniciado ═══ '
-            'Máquina de Estados — Regra da Mão Direita')
-
-    # ══════════════════════════════════════════════════════════════════
-    # Callbacks dos sensores
-    # ══════════════════════════════════════════════════════════════════
+        self.get_logger().info('[NAV] Maze Navigator Híbrido: Centralização OMNI + Memória')
 
     def _odom_cb(self, msg: Odometry):
-        """Atualiza posição (x, y) e yaw a partir da odometria filtrada (EKF)."""
         self.odom_x = msg.pose.pose.position.x
         self.odom_y = msg.pose.pose.position.y
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         self.odom_ready = True
 
     def _scan_cb(self, msg: LaserScan):
-        """Processa LiDAR: extrai distância mínima nos setores frontal e direito."""
         ranges = msg.ranges
-        n = len(ranges)
-        if n == 0:
-            return
+        if not ranges: return
 
-        a_min = msg.angle_min
-        a_inc = msg.angle_increment
-
-        def idx(angle_rad):
-            """Converte ângulo (rad) em índice do array de ranges."""
-            return max(0, min(n - 1, round((angle_rad - a_min) / a_inc)))
-
-        def sector_min(lo_rad, hi_rad):
-            """Retorna a menor distância válida dentro de um setor angular."""
-            i_lo = idx(lo_rad)
-            i_hi = idx(hi_rad)
+        def idx(a): return max(0, min(len(ranges) - 1, round((a - msg.angle_min) / msg.angle_increment)))
+        def sector_min(lo, hi):
             best = self.RANGE_CAP
-            for i in range(min(i_lo, i_hi), max(i_lo, i_hi) + 1):
+            for i in range(min(idx(lo), idx(hi)), max(idx(lo), idx(hi)) + 1):
                 r = ranges[i]
-                if not math.isfinite(r) or r < self.LIDAR_MIN_VALID:
-                    continue
-                best = min(best, min(r, self.RANGE_CAP))
+                if math.isfinite(r) and r >= self.LIDAR_MIN_VALID: best = min(best, min(r, self.RANGE_CAP))
             return best
-
-        def ray_at(angle_rad):
-            """Retorna a distância de um raio específico."""
-            i = idx(angle_rad)
-            r = ranges[i]
-            if not math.isfinite(r) or r < self.LIDAR_MIN_VALID:
-                return self.RANGE_CAP
-            return min(r, self.RANGE_CAP)
+        def ray_at(a):
+            r = ranges[idx(a)]
+            return min(r, self.RANGE_CAP) if math.isfinite(r) and r >= self.LIDAR_MIN_VALID else self.RANGE_CAP
 
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
+        self.left_dist  = sector_min(self.LEFT_LO,  self.LEFT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
-        self.align_side = ray_at(self.ALIGN_SIDE_ANGLE)
-        self.align_diag = ray_at(self.ALIGN_DIAG_ANGLE)
+        self.r_side, self.r_diag = ray_at(self.R_SIDE_ANGLE), ray_at(self.R_DIAG_ANGLE)
+        self.l_side, self.l_diag = ray_at(self.L_SIDE_ANGLE), ray_at(self.L_DIAG_ANGLE)
         self.scan_ready = True
 
-    # ══════════════════════════════════════════════════════════════════
-    # Máquina de Estados — Loop de Controle Principal (10 Hz)
-    # ══════════════════════════════════════════════════════════════════
+    def _image_cb(self, msg: Image):
+        try: cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except: return
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        min_area = self.COLOR_MIN_AREA_FRAC * hsv.shape[0] * hsv.shape[1]
+
+        mask_r = cv2.bitwise_or(cv2.inRange(hsv, self.RED_LOWER1, self.RED_UPPER1), cv2.inRange(hsv, self.RED_LOWER2, self.RED_UPPER2))
+        red_area = cv2.countNonZero(mask_r)
+        green_area = cv2.countNonZero(cv2.inRange(hsv, self.GREEN_LOWER, self.GREEN_UPPER))
+
+        if red_area >= min_area and red_area >= green_area: self.detected_color = 'vermelho'
+        elif green_area >= min_area and green_area > red_area: self.detected_color = 'verde'
+        else: self.detected_color = None
+
+    def _pos_to_cell(self, x: float, y: float):
+        return (math.floor(x / self.CELL_SIZE), math.floor(y / self.CELL_SIZE))
+
+    def _visited_score(self, new_yaw: float) -> int:
+        score = 0
+        for dist in self.BACKTRACK_DISTS:
+            px, py = self.odom_x + dist * math.cos(new_yaw), self.odom_y + dist * math.sin(new_yaw)
+            if self._pos_to_cell(px, py) in self.visited_cells: score += 1
+        return score
+
+    def _choose_turn(self, color_decision: str):
+        yaw_L = normalize_angle(self.current_yaw + math.pi / 2.0)
+        yaw_R = normalize_angle(self.current_yaw - math.pi / 2.0)
+
+        # 1. Hardware Override: Cores ditam a regra
+        if color_decision == 'vermelho': return yaw_L, 1.0, 'esquerda (parede VERMELHA)'
+        if color_decision == 'verde': return yaw_R, -1.0, 'direita (parede VERDE)'
+
+        # 2. Avaliação de Viabilidade (Não virar para paredes sólidas)
+        can_go_left  = self.left_dist > 0.8
+        can_go_right = self.right_dist > 0.8
+
+        score_L, score_R = self._visited_score(yaw_L), self._visited_score(yaw_R)
+
+        # 3. Decisão baseada em Memória + Viabilidade
+        if can_go_left and can_go_right:
+            if score_L <= score_R: return yaw_L, 1.0, f'esquerda (L={score_L} vs R={score_R})'
+            else: return yaw_R, -1.0, f'direita (L={score_L} vs R={score_R})'
+        elif can_go_left:
+            return yaw_L, 1.0, 'esquerda (forçada, direita bloqueada)'
+        elif can_go_right:
+            return yaw_R, -1.0, 'direita (forçada, esquerda bloqueada)'
+        else:
+            # Beco sem saída: vira 90°, na próxima iteração vira mais 90° (Meia-volta)
+            return yaw_L, 1.0, 'meia-volta parcial (beco sem saída)'
+
+    def _lateral_correction(self) -> float:
+        L, R = self.left_dist, self.right_dist
+        left_wall, right_wall = L < self.WALL_DETECT, R < self.WALL_DETECT
+
+        if left_wall and right_wall: error = (L - R) / 2.0
+        elif right_wall: error = self.TARGET_SIDE - R
+        elif left_wall: error = L - self.TARGET_SIDE
+        else: error = 0.0
+
+        return max(-self.LAT_CLAMP, min(self.KP_LAT * error, self.LAT_CLAMP))
+
+    def _heading_correction(self) -> float:
+        corrections = []
+        a, b = self.r_side, self.r_diag
+        if a < self.WALL_DETECT and b < self.RANGE_CAP - 0.1:
+            corrections.append(math.atan2(a - b * 0.7071, b * 0.7071))
+
+        c, d = self.l_side, self.l_diag
+        if c < self.WALL_DETECT and d < self.RANGE_CAP - 0.1:
+            corrections.append(math.atan2(d * 0.7071 - c, d * 0.7071))
+
+        if not corrections: return 0.0
+        az = self.ALIGN_KP * (sum(corrections) / len(corrections))
+        return max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
 
     def _control_loop(self):
-        """Despacha o controle para o estado atual da máquina."""
-        if not self.scan_ready or not self.odom_ready:
-            return
+        if not self.scan_ready or not self.odom_ready: return
 
         self.loop_count += 1
-        F = self.front_dist
-        R = self.right_dist
-
-        # Cria mensagem de velocidade — linear.y = 0.0 SEMPRE
+        self.visited_cells.add(self._pos_to_cell(self.odom_x, self.odom_y))
         twist = Twist()
-        twist.linear.y = 0.0
 
-        # Despacha para o estado atual
-        if self.state == 'INITIAL_STRAIGHT':
-            self._state_initial_straight(twist, F)
-        elif self.state == 'TURNING':
-            self._state_turning(twist)
-        elif self.state == 'OUTER_CORNER':
-            self._state_outer_corner(twist, F)
-        else:
-            # FOLLOW_WALL é o estado padrão
-            self._state_follow_wall(twist, F, R)
+        if self.state == 'COLOR_CHECK': self._state_color_check(twist)
+        elif self.state == 'TURNING': self._state_turning(twist)
+        else: self._state_follow_corridor(twist)
 
-        # Publica o comando de velocidade
         self.cmd_pub.publish(twist)
 
-    # ──────────────────────────────────────────────────────────────────
-    # ESTADO: INITIAL_STRAIGHT (Largada Segura)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _state_initial_straight(self, twist: Twist, F: float):
-        """
-        Largada: vai puramente reto ignorando paredes laterais.
-        Quando a frente bloqueia (< 0.6m), entra em INNER_CORNER (giro esquerda).
-        """
-
-        if F <= self.FRONT_BLOCKED:
-            self.target_yaw = normalize_angle(
-                self.current_yaw + math.pi / 2.0)
-            self.turn_direction = 1.0
-            self.state = 'TURNING'
-            self.get_logger().info(
-                f'[NAV] INITIAL_STRAIGHT → TURNING esquerda  '
-                f'F={F:.2f}m  target_yaw={math.degrees(self.target_yaw):.1f}°')
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
+    def _state_follow_corridor(self, twist: Twist):
+        if self.front_dist <= self.FRONT_BLOCKED:
+            self.state = 'COLOR_CHECK'
+            self.color_check_count, self.color_check_samples = 0, []
+            self.lat_cmd = 0.0
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
 
-        twist.linear.x = self.FORWARD_SPEED
-        twist.angular.z = 0.0
+        self.lat_cmd = (1.0 - self.LAT_ALPHA) * self.lat_cmd + self.LAT_ALPHA * self._lateral_correction()
+        twist.linear.x, twist.linear.y, twist.angular.z = self.FORWARD_SPEED, self.lat_cmd, self._heading_correction()
 
-        if self.loop_count % 20 == 0:
-            self.get_logger().info(
-                f'[NAV] INITIAL_STRAIGHT  F={F:.2f}m  (indo reto)')
-
-    # ──────────────────────────────────────────────────────────────────
-    # ESTADO: FOLLOW_WALL (Padrão)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _state_follow_wall(self, twist: Twist, F: float, R: float):
-        """
-        Anda reto com correção de alinhamento paralelo à parede direita.
-
-        Usa dois raios (-90° e -45°) para calcular o ângulo do robô em
-        relação à parede. Se há drift, aplica correção proporcional suave.
-        Sem parede visível, vai puramente reto.
-
-        Transições:
-          - Frente bloqueada (F <= 0.6m) → TURNING esquerda 90°
-          - Parede sumiu (R > 0.85m)     → OUTER_CORNER → avanço + TURNING direita 90°
-        """
-
-        # ── PRIORIDADE MÁXIMA: Frente bloqueada → giro 90° esquerda ──
-        if F <= self.FRONT_BLOCKED:
-            self.target_yaw = normalize_angle(
-                self.current_yaw + math.pi / 2.0)
-            self.turn_direction = 1.0
-            self.state = 'TURNING'
-            self.get_logger().info(
-                f'[NAV] FOLLOW_WALL → TURNING esquerda  '
-                f'F={F:.2f}m  R={R:.2f}m  '
-                f'target_yaw={math.degrees(self.target_yaw):.1f}°')
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
+    def _state_color_check(self, twist: Twist):
+        if self.front_dist > self.FRONT_BLOCKED + 0.1:
+            self.state = 'FOLLOW_CORRIDOR'
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
             return
 
-        # ── Parede direita sumiu → OUTER_CORNER ──
-        if self.wall_found and R > self.RIGHT_LOST:
-            self.state = 'OUTER_CORNER'
-            self.advance_start_x = self.odom_x
-            self.advance_start_y = self.odom_y
-            self.get_logger().info(
-                f'[NAV] FOLLOW_WALL → OUTER_CORNER  '
-                f'R={R:.2f}m  F={F:.2f}m')
-            twist.linear.x = self.FORWARD_SPEED
-            twist.angular.z = 0.0
-            return
+        twist.linear.x = twist.linear.y = twist.angular.z = 0.0
+        self.color_check_samples.append(self.detected_color)
+        self.color_check_count += 1
 
-        # ── Marca parede detectada (habilita OUTER_CORNER no futuro) ──
-        if not self.wall_found and R < self.RIGHT_PRESENT:
-            self.wall_found = True
-            self.get_logger().info(
-                f'[NAV] Parede direita confirmada (R={R:.2f}m)')
-
-        # ── Andar reto com alinhamento paralelo ──
-        twist.linear.x = self.FORWARD_SPEED
-
-        a = self.align_side  # raio a -90° (perpendicular)
-        b = self.align_diag  # raio a -45° (diagonal)
-
-        if a < self.RIGHT_PRESENT and b < self.RANGE_CAP - 0.1:
-            # Pontos onde os raios atingem a parede:
-            #   P_side = (0, -a)                          (raio a -90°)
-            #   P_diag = (b*cos45, -b*sin45)              (raio a -45°)
-            # Vetor da parede: P_diag - P_side
-            #   dx = b*cos45,  dy = a - b*sin45
-            # Se paralelo → dy = 0. Desvio → heading_error = atan2(dy, dx)
-            dx = b * 0.7071
-            dy = a - b * 0.7071
-            heading_error = math.atan2(dy, dx)
-            az = self.ALIGN_KP * heading_error
-            twist.angular.z = max(-self.ALIGN_CLAMP, min(az, self.ALIGN_CLAMP))
-        else:
-            twist.angular.z = 0.0
-
-        if self.loop_count % 20 == 0:
-            self.get_logger().info(
-                f'[NAV] FOLLOW_WALL  F={F:.2f}m  R={R:.2f}m  '
-                f'side={a:.2f}m  diag={b:.2f}m  az={twist.angular.z:+.3f}')
-
-    # ──────────────────────────────────────────────────────────────────
-    # ESTADO: OUTER_CORNER (Quina à Direita)
-    # ──────────────────────────────────────────────────────────────────
-
-    def _state_outer_corner(self, twist: Twist, F: float):
-        """
-        A parede direita sumiu — estamos numa quina externa.
-        1) Avança reto 0.3m para que o eixo traseiro passe da quina.
-        2) Depois do avanço, calcula target_yaw = -90° e vai para TURNING.
-
-        Segurança: se frente bloquear durante o avanço, desvia à esquerda.
-        """
-
-        # ── Segurança: frente bloqueada durante avanço → virar esquerda ──
-        if F <= self.FRONT_BLOCKED:
-            self.target_yaw = normalize_angle(
-                self.current_yaw + math.pi / 2.0)
-            self.turn_direction = 1.0
+        if self.color_check_count >= self.COLOR_CHECK_CYCLES:
+            counts = Counter(self.color_check_samples)
+            color_decision = counts.most_common(1)[0][0]
+            self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
             self.state = 'TURNING'
-            self.get_logger().info(
-                f'[NAV] OUTER_CORNER interrompido (frente bloqueada F={F:.2f}m) '
-                f'→ TURNING esquerda')
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-            return
-
-        # Calcula distância percorrida desde o início do avanço
-        dx = self.odom_x - self.advance_start_x
-        dy = self.odom_y - self.advance_start_y
-        dist = math.hypot(dx, dy)
-
-        if dist >= self.ADVANCE_DIST:
-            # ── Avanço concluído → girar 90° à direita ──
-            self.target_yaw = normalize_angle(
-                self.current_yaw - math.pi / 2.0)
-            self.turn_direction = -1.0  # direita (angular.z negativo)
-            self.state = 'TURNING'
-            self.get_logger().info(
-                f'[NAV] OUTER_CORNER avanço concluído ({dist:.2f}m) '
-                f'→ TURNING direita  '
-                f'target_yaw={math.degrees(self.target_yaw):.1f}°')
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-        else:
-            # Ainda avançando reto (sem girar)
-            twist.linear.x = self.FORWARD_SPEED
-            twist.angular.z = 0.0
-
-    # ──────────────────────────────────────────────────────────────────
-    # ESTADO: TURNING (Giro Controlado por Odometria)
-    # ──────────────────────────────────────────────────────────────────
+            self.get_logger().info(f'[NAV] Decisão: {desc}')
 
     def _state_turning(self, twist: Twist):
-        """
-        Gira no lugar (linear.x = 0) na direção planejada até atingir
-        target_yaw com tolerância de ±0.05 rad.
-        """
         error = normalize_angle(self.target_yaw - self.current_yaw)
-
         if abs(error) < self.YAW_TOLERANCE:
-            # ── Giro concluído → voltar para FOLLOW_WALL ──
-            self.state = 'FOLLOW_WALL'
-            self.wall_found = False  # re-detectar parede antes de habilitar OUTER_CORNER
-            self.get_logger().info(
-                f'[NAV] TURNING concluído → FOLLOW_WALL  '
-                f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                f'erro_final={math.degrees(error):.1f}°')
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
+            self.state = 'FOLLOW_CORRIDOR'
+            self.lat_cmd = 0.0
+            twist.linear.x = twist.linear.y = twist.angular.z = 0.0
         else:
-            # ── Continua girando na direção planejada ──
-            twist.linear.x = 0.0
+            twist.linear.x = twist.linear.y = 0.0
             twist.angular.z = self.TURN_SPEED * self.turn_direction
-            # Log periódico durante giro
-            if self.loop_count % 5 == 0:
-                self.get_logger().info(
-                    f'[NAV] TURNING  erro={math.degrees(error):.1f}°  '
-                    f'az={twist.angular.z:+.2f}  '
-                    f'yaw={math.degrees(self.current_yaw):.1f}°  '
-                    f'target={math.degrees(self.target_yaw):.1f}°')
-
-    # ──────────────────────────────────────────────────────────────────
-    # Cleanup
-    # ──────────────────────────────────────────────────────────────────
 
     def destroy_node(self):
-        """Para o robô (velocidade zero) antes de destruir o nó."""
         self.cmd_pub.publish(Twist())
         super().destroy_node()
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# Ponto de entrada
-# ═══════════════════════════════════════════════════════════════════════
-
 def main(args=None):
     rclpy.init(args=args)
-    node = MazeNavigator()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+    try: rclpy.spin(MazeNavigator())
+    except KeyboardInterrupt: pass
+    finally: rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
