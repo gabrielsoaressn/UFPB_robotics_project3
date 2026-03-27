@@ -27,9 +27,9 @@ from datetime import datetime
 
 class ColorWallCounter(Node):
 
-    MIN_AREA_FRACTION = 0.03
+    MIN_AREA_FRACTION = 0.35
     COOLDOWN_SECS = 5.0
-    MIN_DISTANCE = 2.0  # metros — distancia minima entre deteccoes da mesma cor
+    MIN_DISTANCE = 2.5  # metros — distancia minima entre deteccoes da mesma cor
 
     COLOR_RANGES = {
         'azul': [
@@ -115,6 +115,15 @@ class ColorWallCounter(Node):
             largest = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(largest)
             if area < min_area:
+                continue
+
+            # 3. Trava de Centro: Garante que a parede está na FRENTE do robô, e não de lado.
+            M = cv2.moments(largest)
+            if M['m00'] == 0:
+                continue
+            cx = M['m10'] / M['m00']
+            # Se o centro da cor estiver fora dos 40% centrais da imagem, ignora.
+            if abs(cx - w / 2.0) > 0.20 * w:
                 continue
 
             # Cooldown temporal
