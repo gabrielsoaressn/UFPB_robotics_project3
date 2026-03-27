@@ -219,6 +219,15 @@ class MazeNavigator(Node):
                     best = min(best, min(r, self.RANGE_CAP))
             return best
 
+        def sector_max(lo, hi):
+            """Retorna a MAIOR leitura válida no setor — detecta aberturas."""
+            worst = 0.0
+            for i in range(min(idx(lo), idx(hi)), max(idx(lo), idx(hi)) + 1):
+                r = ranges[i]
+                if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
+                    worst = max(worst, min(r, self.RANGE_CAP))
+            return worst
+
         def ray_at(a):
             r = ranges[idx(a)]
             if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
@@ -228,6 +237,9 @@ class MazeNavigator(Node):
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.left_dist  = sector_min(self.LEFT_LO,  self.LEFT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
+        # Máximo lateral: se algum raio vê longe, existe uma abertura → não é beco
+        self.left_max  = sector_max(self.LEFT_LO,  self.LEFT_HI)
+        self.right_max = sector_max(self.RIGHT_LO, self.RIGHT_HI)
         self.r_side = ray_at(self.R_SIDE_ANGLE)
         self.r_diag = ray_at(self.R_DIAG_ANGLE)
         self.l_side = ray_at(self.L_SIDE_ANGLE)
