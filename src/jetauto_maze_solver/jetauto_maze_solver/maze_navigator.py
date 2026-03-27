@@ -16,7 +16,7 @@ Estados:
   ADVANCE         -> avanca brevemente apos curva para entrar no novo corredor
 
 Topicos:
-  Assina: /jetauto/lidar/scan, /odometry/filtered, /jetauto/camera/image_raw
+  Assina: /jetauto/lidar/scan, /odometry/filtered, /jetauto/camera/image_raw (Gazebo URDF)
   Publica: /jetauto/cmd_vel
 """
 
@@ -112,7 +112,7 @@ class MazeNavigator(Node):
 
         self.create_subscription(LaserScan, '/jetauto/lidar/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self._odom_cb, 10)
-        self.create_subscription(Image, '/camera/image_raw', self._image_cb, 10)
+        self.create_subscription(Image, '/jetauto/camera/image_raw', self._image_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, '/jetauto/cmd_vel', 10)
         self.bridge = CvBridge()
