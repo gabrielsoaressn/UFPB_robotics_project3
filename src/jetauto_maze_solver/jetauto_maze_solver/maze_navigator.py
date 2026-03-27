@@ -73,6 +73,7 @@ class MazeNavigator(Node):
 
     # ── Limiares de distância (metros) ─────────────────────────────
     FRONT_BLOCKED = 0.7     # frente bloqueada → inicia COLOR_CHECK (antecipado)
+    SIDE_BLOCKED  = 0.7     # lateral bloqueada → critério de beco sem saída
     WALL_DETECT   = 1.2     # considera parede presente se < este valor
     TARGET_SIDE   = 0.4     # distância desejada à parede (só um lado)
 
@@ -133,6 +134,8 @@ class MazeNavigator(Node):
         self.front_dist = self.RANGE_CAP
         self.left_dist  = self.RANGE_CAP
         self.right_dist = self.RANGE_CAP
+        self.left_max   = self.RANGE_CAP
+        self.right_max  = self.RANGE_CAP
         self.r_side = self.RANGE_CAP
         self.r_diag = self.RANGE_CAP
         self.l_side = self.RANGE_CAP
@@ -196,6 +199,14 @@ class MazeNavigator(Node):
                     best = min(best, min(r, self.RANGE_CAP))
             return best
 
+        def sector_max(lo, hi):
+            best = 0.0
+            for i in range(min(idx(lo), idx(hi)), max(idx(lo), idx(hi)) + 1):
+                r = ranges[i]
+                if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
+                    best = max(best, min(r, self.RANGE_CAP))
+            return best
+
         def ray_at(a):
             r = ranges[idx(a)]
             if math.isfinite(r) and r >= self.LIDAR_MIN_VALID:
@@ -205,6 +216,8 @@ class MazeNavigator(Node):
         self.front_dist = sector_min(self.FRONT_LO, self.FRONT_HI)
         self.left_dist  = sector_min(self.LEFT_LO,  self.LEFT_HI)
         self.right_dist = sector_min(self.RIGHT_LO, self.RIGHT_HI)
+        self.left_max   = sector_max(self.LEFT_LO,  self.LEFT_HI)
+        self.right_max  = sector_max(self.RIGHT_LO, self.RIGHT_HI)
         self.r_side = ray_at(self.R_SIDE_ANGLE)
         self.r_diag = ray_at(self.R_DIAG_ANGLE)
         self.l_side = ray_at(self.L_SIDE_ANGLE)
@@ -285,13 +298,6 @@ class MazeNavigator(Node):
 
         # ── Cor da câmera ──
         effective_color = color_decision
-        if effective_color is None and self.recent_color is not None:
-            if self.recent_color_ts is not None:
-                elapsed = (self.get_clock().now() - self.recent_color_ts).nanoseconds / 1e9
-                if elapsed <= self.APPROACH_MEMORY_SECS:
-                    effective_color = self.recent_color
-                    self.get_logger().info(
-                        f'[NAV] Usando cor da memória: {effective_color} ({elapsed:.1f}s atrás)')
 
         if effective_color == 'vermelho':
             target = normalize_angle(self.current_yaw + math.pi / 2.0)
