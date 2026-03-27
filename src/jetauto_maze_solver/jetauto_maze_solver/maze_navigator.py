@@ -266,8 +266,8 @@ class MazeNavigator(Node):
         self.color_check_count += 1
 
         if self.color_check_count >= self.COLOR_CHECK_CYCLES:
-            counts = Counter(self.color_check_samples)
-            color_decision = counts.most_common(1)[0][0]
+            color_samples = [s for s in self.color_check_samples if s is not None]
+            color_decision = Counter(color_samples).most_common(1)[0][0] if color_samples else None
             self.target_yaw, self.turn_direction, desc = self._choose_turn(color_decision)
             self.state = 'TURNING'
             self.get_logger().info(f'[NAV] Decisão: {desc}')
